@@ -1,0 +1,26 @@
+[project]
+name = "minos-uview-sparse-cnn"
+version = "0.1.0"
+description = "Simple U-View Sparse CNN for MINOS Event Classification using TorchSparse"
+readme = "README.md"
+requires-python = ">=3.10, <3.11"
+dependencies = [
+    "torch>=2.0.0",
+    "uproot>=5.0.0",
+    "awkward>=2.0.0",
+    "numpy>=1.22.0,<2.0.0",
+    "pandas>=2.0.0",
+    "scikit-learn>=1.2.0",
+    "matplotlib>=3.7.0",
+    "jupyter>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.uv.extra-build-dependencies]
+torch-sparse = ["torch"]
