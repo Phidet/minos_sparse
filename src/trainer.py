@@ -4,6 +4,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import StepLR
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 
 from src.torchsparse import SparseTensor
@@ -117,6 +119,8 @@ def train_model(
     num_epochs: int = 10,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
+    step_size: int = 3,
+    gamma: float = 0.1,
     class_weights: Optional[torch.Tensor] = None,
     device: torch.device = torch.device("cpu"),
     verbose: bool = True
@@ -129,12 +133,14 @@ def train_model(
     else:
         criterion = nn.CrossEntropyLoss()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = StepLR(optimizer, step_size=step_size, gamma=gamma)
 
     history = {
         "train_loss": [], "train_acc": [],
         "val_loss": [], "val_acc": [],
-        "val_f1": [], "val_auc": []
+        "val_f1": [], "val_auc": [],
+        "lr": []
     }
 
     start_time = time.time()
@@ -145,8 +151,10 @@ def train_model(
         print(f"Starting TorchSparse model training on {device} ({num_epochs} epochs)...")
 
     for epoch in range(1, num_epochs + 1):
+        current_lr = optimizer.param_groups[0]["lr"]
         tr_loss, tr_acc = train_epoch(model, train_loader, optimizer, criterion, device)
         val_loss, val_acc, val_metrics, _, _ = validate_epoch(model, val_loader, criterion, device)
+        scheduler.step()
 
         history["train_loss"].append(tr_loss)
         history["train_acc"].append(tr_acc)
@@ -154,6 +162,7 @@ def train_model(
         history["val_acc"].append(val_acc)
         history["val_f1"].append(val_metrics["f1"])
         history["val_auc"].append(val_metrics["roc_auc"])
+        history["lr"].append(current_lr)
 
         if val_metrics["f1"] > best_f1:
             best_f1 = val_metrics["f1"]
@@ -162,7 +171,7 @@ def train_model(
 
         if verbose:
             print(
-                f"Epoch [{epoch:02d}/{num_epochs:02d}] | "
+                f"Epoch [{epoch:02d}/{num_epochs:02d}] | LR: {current_lr:.1e} | "
                 f"Train Loss: {tr_loss:.4f} Acc: {tr_acc*100:.2f}% | "
                 f"Val Loss: {val_loss:.4f} Acc: {val_acc*100:.2f}% "
                 f"F1: {val_metrics['f1']:.4f} AUC: {val_metrics['roc_auc']:.4f}"
