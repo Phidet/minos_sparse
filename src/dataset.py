@@ -33,6 +33,11 @@ class MINOSSingleViewDataset(Dataset):
     Lightweight Dataset parser for single-view (U-view) MINOS event displays.
     Target view = 2 (U-view).
     Target label: CC (1) vs NC (0) based on iaction branch.
+
+    Supported feature_mode options:
+      - 'sum': Single channel [log1p(ph0 + ph1)]
+      - 'dual_ph': 2 channels [log1p(ph0), log1p(ph1)]
+      - 'ph_full': 4 channels [log1p(ph0 + ph1), log1p(ph0), log1p(ph1), asymmetry_ratio]
     """
 
     def __init__(
@@ -40,12 +45,14 @@ class MINOSSingleViewDataset(Dataset):
         root_filepath: str,
         max_events: Optional[int] = None,
         target_view: int = 2,
+        feature_mode: str = "dual_ph",
         cache_path: Optional[str] = None,
         allow_root_fallback: bool = True,
     ):
         super().__init__()
         self.root_filepath = Path(root_filepath)
         self.target_view = target_view
+        self.feature_mode = str(feature_mode)
         self.events = []
 
         cache_file = Path(cache_path) if cache_path is not None else None
@@ -54,10 +61,17 @@ class MINOSSingleViewDataset(Dataset):
             if cache.get("kind") != "single_view":
                 raise ValueError(f"Cache {cache_file} does not contain single-view events")
 
-            self.root_filepath = Path(cache.get("root_filepath", self.root_filepath))
-            self.target_view = int(cache.get("target_view", self.target_view))
-            self.events = cache["events"]
-            return
+            cached_feature_mode = cache.get("feature_mode", "sum")
+            if cached_feature_mode == self.feature_mode:
+                self.root_filepath = Path(cache.get("root_filepath", self.root_filepath))
+                self.target_view = int(cache.get("target_view", self.target_view))
+                self.events = cache["events"]
+                return
+            elif not allow_root_fallback:
+                raise ValueError(
+                    f"Cache {cache_file} has feature_mode='{cached_feature_mode}', "
+                    f"but requested feature_mode='{self.feature_mode}' and allow_root_fallback=False."
+                )
 
         if cache_file is not None and not allow_root_fallback:
             raise FileNotFoundError(f"Cache file not found: {cache_file}")
@@ -105,11 +119,26 @@ class MINOSSingleViewDataset(Dataset):
 
             sel_planes = planes[mask]
             sel_strips = strips[mask]
+            sel_ph0 = ph0[mask]
+            sel_ph1 = ph1[mask]
             sel_phs = phs[mask]
 
-            norm_phs = np.log1p(np.maximum(0.0, sel_phs)).astype(np.float32)
+            if self.feature_mode == "dual_ph":
+                norm_ph0 = np.log1p(np.maximum(0.0, sel_ph0)).astype(np.float32)
+                norm_ph1 = np.log1p(np.maximum(0.0, sel_ph1)).astype(np.float32)
+                feats = np.column_stack((norm_ph0, norm_ph1))
+            elif self.feature_mode == "ph_full":
+                norm_sum = np.log1p(np.maximum(0.0, sel_phs)).astype(np.float32)
+                norm_ph0 = np.log1p(np.maximum(0.0, sel_ph0)).astype(np.float32)
+                norm_ph1 = np.log1p(np.maximum(0.0, sel_ph1)).astype(np.float32)
+                denom = sel_phs + 1e-5
+                asym = ((sel_ph0 - sel_ph1) / denom).astype(np.float32)
+                feats = np.column_stack((norm_sum, norm_ph0, norm_ph1, asym))
+            else:
+                norm_phs = np.log1p(np.maximum(0.0, sel_phs)).astype(np.float32)
+                feats = norm_phs[:, np.newaxis]
+
             coords = np.column_stack((sel_planes, sel_strips)).astype(np.int64)
-            feats = norm_phs[:, np.newaxis]
 
             self.events.append({
                 "coords": torch.tensor(coords, dtype=torch.long),
@@ -125,10 +154,19 @@ class MINOSSingleViewDataset(Dataset):
                     "kind": "single_view",
                     "root_filepath": str(self.root_filepath),
                     "target_view": self.target_view,
+                    "feature_mode": self.feature_mode,
                     "max_events": max_events,
                     "events": self.events,
                 },
             )
+
+    @property
+    def in_channels(self) -> int:
+        if self.feature_mode == "dual_ph":
+            return 2
+        elif self.feature_mode == "ph_full":
+            return 4
+        return 1
 
     def __len__(self) -> int:
         return len(self.events)
@@ -224,6 +262,11 @@ class MINOSMultiViewGraphDataset(Dataset):
     Each event becomes a heterograph with one node type per view and a shared
     nexus node type keyed by plane coordinate. Supports standard radius edge
     construction and Delaunay/KNN mesh edge construction.
+
+    Supported feature_mode options:
+      - 'sum': 1 hit feature [log1p(ph0 + ph1)]
+      - 'dual_ph': 2 hit features [log1p(ph0), log1p(ph1)]
+      - 'ph_full': 4 hit features [log1p(ph0 + ph1), log1p(ph0), log1p(ph1), asymmetry_ratio]
     """
 
     def __init__(
@@ -234,6 +277,7 @@ class MINOSMultiViewGraphDataset(Dataset):
         plane_radius: int = 1,
         strip_radius: int = 2,
         graph_mode: str = "radius",
+        feature_mode: str = "dual_ph",
         cache_path: Optional[str] = None,
         allow_root_fallback: bool = True,
     ):
@@ -243,6 +287,7 @@ class MINOSMultiViewGraphDataset(Dataset):
         self.plane_radius = int(plane_radius)
         self.strip_radius = int(strip_radius)
         self.graph_mode = str(graph_mode)
+        self.feature_mode = str(feature_mode)
         self.events = []
 
         cache_file = Path(cache_path) if cache_path is not None else None
@@ -252,19 +297,23 @@ class MINOSMultiViewGraphDataset(Dataset):
                 raise ValueError(f"Cache {cache_file} does not contain multi-view graph events")
 
             cached_view_ids = tuple(cache.get("view_ids", ()))
-            if view_ids is not None and tuple(int(v) for v in view_ids) != cached_view_ids:
-                raise ValueError(
-                    f"Cache {cache_file} was built for view_ids={cached_view_ids}, "
-                    f"not {tuple(int(v) for v in view_ids)}"
-                )
+            cached_feature_mode = cache.get("feature_mode", "sum")
+            valid_view_ids = (view_ids is None or tuple(int(v) for v in view_ids) == cached_view_ids)
+            valid_mode = (cached_feature_mode == self.feature_mode)
 
-            self.root_filepath = Path(cache.get("root_filepath", self.root_filepath))
-            self.view_ids = cached_view_ids
-            self.plane_radius = int(cache.get("plane_radius", self.plane_radius))
-            self.strip_radius = int(cache.get("strip_radius", self.strip_radius))
-            self.graph_mode = str(cache.get("graph_mode", self.graph_mode))
-            self.events = cache["events"]
-            return
+            if valid_view_ids and valid_mode:
+                self.root_filepath = Path(cache.get("root_filepath", self.root_filepath))
+                self.view_ids = cached_view_ids
+                self.plane_radius = int(cache.get("plane_radius", self.plane_radius))
+                self.strip_radius = int(cache.get("strip_radius", self.strip_radius))
+                self.graph_mode = str(cache.get("graph_mode", self.graph_mode))
+                self.events = cache["events"]
+                return
+            elif not allow_root_fallback:
+                raise ValueError(
+                    f"Cache {cache_file} invalid for view_ids={view_ids}, feature_mode={self.feature_mode} "
+                    f"and allow_root_fallback=False."
+                )
 
         if cache_file is not None and not allow_root_fallback:
             raise FileNotFoundError(f"Cache file not found: {cache_file}")
@@ -325,9 +374,8 @@ class MINOSMultiViewGraphDataset(Dataset):
             strips = np.array(branches["NtpStRecord/stp/stp.strip"][i])
             ph0 = np.array(branches["NtpStRecord/stp/stp.ph0.pe"][i])
             ph1 = np.array(branches["NtpStRecord/stp/stp.ph1.pe"][i])
-            phs = ph0 + ph1
 
-            event = self._build_event_graph(views, planes, strips, phs, label, true_energy)
+            event = self._build_event_graph(views, planes, strips, ph0, ph1, label, true_energy)
             if event is not None:
                 self.events.append(event)
 
@@ -347,24 +395,53 @@ class MINOSMultiViewGraphDataset(Dataset):
                     "plane_radius": self.plane_radius,
                     "strip_radius": self.strip_radius,
                     "graph_mode": self.graph_mode,
+                    "feature_mode": self.feature_mode,
                     "max_events": max_events,
                     "events": self.events,
                 },
             )
 
-    def _view_feature_matrix(self, planes: np.ndarray, strips: np.ndarray, phs: np.ndarray) -> torch.Tensor:
-        norm_charge = np.log1p(np.maximum(0.0, phs)).astype(np.float32)
+    @property
+    def in_channels(self) -> int:
+        if self.feature_mode == "dual_ph":
+            return 2
+        elif self.feature_mode == "ph_full":
+            return 4
+        return 1
+
+    def _view_feature_matrix(
+        self,
+        planes: np.ndarray,
+        strips: np.ndarray,
+        ph0: np.ndarray,
+        ph1: np.ndarray,
+    ) -> torch.Tensor:
+        phs = ph0 + ph1
         plane_feat = planes.astype(np.float32)
         strip_feat = strips.astype(np.float32)
         denom_plane = float(max(1, int(np.max(np.abs(plane_feat))) if plane_feat.size else 1))
         denom_strip = float(max(1, int(np.max(np.abs(strip_feat))) if strip_feat.size else 1))
 
+        if self.feature_mode == "dual_ph":
+            norm_ph0 = np.log1p(np.maximum(0.0, ph0)).astype(np.float32)
+            norm_ph1 = np.log1p(np.maximum(0.0, ph1)).astype(np.float32)
+            charge_feats = [norm_ph0, norm_ph1]
+        elif self.feature_mode == "ph_full":
+            norm_sum = np.log1p(np.maximum(0.0, phs)).astype(np.float32)
+            norm_ph0 = np.log1p(np.maximum(0.0, ph0)).astype(np.float32)
+            norm_ph1 = np.log1p(np.maximum(0.0, ph1)).astype(np.float32)
+            denom = phs + 1e-5
+            asym = ((ph0 - ph1) / denom).astype(np.float32)
+            charge_feats = [norm_sum, norm_ph0, norm_ph1, asym]
+        else:
+            norm_charge = np.log1p(np.maximum(0.0, phs)).astype(np.float32)
+            charge_feats = [norm_charge]
+
         feats = np.column_stack(
-            [
-                norm_charge,
+            charge_feats + [
                 plane_feat / denom_plane,
                 strip_feat / denom_strip,
-                np.ones_like(norm_charge, dtype=np.float32),
+                np.ones_like(planes, dtype=np.float32),
             ]
         ).astype(np.float32)
         return torch.tensor(feats, dtype=torch.float32)
@@ -422,7 +499,8 @@ class MINOSMultiViewGraphDataset(Dataset):
         views: np.ndarray,
         planes: np.ndarray,
         strips: np.ndarray,
-        phs: np.ndarray,
+        ph0: np.ndarray,
+        ph1: np.ndarray,
         label: int,
         true_energy: float,
     ):
@@ -457,10 +535,11 @@ class MINOSMultiViewGraphDataset(Dataset):
         for node_type, mask in view_specs:
             node_planes = planes[mask].astype(np.int64)
             node_strips = strips[mask].astype(np.int64)
-            node_phs = phs[mask]
+            node_ph0 = ph0[mask]
+            node_ph1 = ph1[mask]
             coords = np.column_stack([node_planes, node_strips]).astype(np.int64)
 
-            data[node_type].x = self._view_feature_matrix(node_planes, node_strips, node_phs)
+            data[node_type].x = self._view_feature_matrix(node_planes, node_strips, node_ph0, node_ph1)
             data[node_type].plane = torch.tensor(node_planes, dtype=torch.long)
             data[node_type].strip = torch.tensor(node_strips, dtype=torch.long)
             data[node_type].pos = torch.tensor(coords, dtype=torch.long)
