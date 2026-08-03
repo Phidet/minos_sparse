@@ -22,6 +22,7 @@ from .models import (
     DualViewCrossGateSparseCNN,
     DualViewHybridTransformerSparseCNN,
     DualViewMultiLayerTransformerSparseCNN,
+    DualViewZipperSparseCNN,
     MinimumViableMINOSGNN,
     NuGraphInspiredBinaryGNN,
 )
@@ -48,6 +49,7 @@ __all__ = [
     'DualViewCrossGateSparseCNN',
     'DualViewHybridTransformerSparseCNN',
     'DualViewMultiLayerTransformerSparseCNN',
+    'DualViewZipperSparseCNN',
     'MinimumViableMINOSGNN',
     'NuGraphInspiredBinaryGNN',
     'train_epoch',

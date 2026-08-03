@@ -1294,6 +1294,164 @@ class DualViewMultiLayerTransformerSparseCNN(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class DualViewZipperSparseCNN(nn.Module):
+    r"""
+    Dual-View Zipper Sparse CNN for MINOS U/V event classification.
+
+    Processes U and V views using 2D SubMConv2d feature extraction backbones.
+    Per-plane 1D summaries along Z are extracted for View A and View B, and
+    zipper-interleaved into a single 1D plane sequence along Z of length 2 * max_planes:
+      [A(0), B(0), A(1), B(1), A(2), B(2), ..., A(M-1), B(M-1)]
+
+    1D Convolutions (Conv1d) slide along this physical plane sequence to pick up
+    longitudinal 3D energy deposition patterns, track slopes, and shower development.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        conv_channels: List[int] = [16, 32],
+        conv1d_channels: List[int] = [32, 64],
+        fc_dims: List[int] = [32],
+        num_classes: int = 2,
+        dropout: float = 0.1,
+        spatial_shape: Tuple[int, int] = (486, 192)
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.conv_channels = conv_channels
+        self.conv1d_channels = conv1d_channels
+        self.spatial_shape = spatial_shape
+        max_planes = spatial_shape[0]
+
+        c1 = conv_channels[0] if len(conv_channels) > 0 else 16
+        c2 = conv_channels[1] if len(conv_channels) > 1 else c1
+
+        # 2D Sparse CNN backbones for View A and View B
+        self.block1_a = nn.Sequential(
+            spnn.SubMConv2d(in_channels, c1, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c1),
+            spnn.ReLU(),
+        )
+        self.block1_b = nn.Sequential(
+            spnn.SubMConv2d(in_channels, c1, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c1),
+            spnn.ReLU(),
+        )
+
+        self.block2_a = nn.Sequential(
+            spnn.SubMConv2d(c1, c2, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c2),
+            spnn.ReLU(),
+        )
+        self.block2_b = nn.Sequential(
+            spnn.SubMConv2d(c1, c2, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c2),
+            spnn.ReLU(),
+        )
+
+        # 1D Positional Embedding for plane Z
+        self.pos_embed = nn.Parameter(torch.randn(1, max_planes, c2) * 0.02)
+
+        # 1D Convolution Stack over Zippered Sequence
+        conv1d_layers = []
+        prev_c = c2
+        for i, out_c in enumerate(conv1d_channels):
+            conv1d_layers.append(
+                nn.Conv1d(prev_c, out_c, kernel_size=3, padding=1)
+            )
+            conv1d_layers.append(nn.BatchNorm1d(out_c))
+            conv1d_layers.append(nn.SiLU())
+            if i % 2 == 1:
+                conv1d_layers.append(nn.MaxPool1d(kernel_size=2, stride=2))
+            if dropout > 0.0:
+                conv1d_layers.append(nn.Dropout(dropout))
+            prev_c = out_c
+
+        self.conv1d_stack = nn.Sequential(*conv1d_layers)
+
+        # Classifier
+        classifier_layers = []
+        current_dim = prev_c * 2  # Mean pooling + Max pooling across 1D sequence
+        for fc_dim in fc_dims:
+            classifier_layers.append(nn.Linear(current_dim, fc_dim))
+            classifier_layers.append(nn.SiLU())
+            if dropout > 0.0:
+                classifier_layers.append(nn.Dropout(dropout))
+            current_dim = fc_dim
+
+        classifier_layers.append(nn.Linear(current_dim, num_classes))
+        self.classifier = nn.Sequential(*classifier_layers)
+
+    def _extract_sparse_tensors(self, data) -> Tuple[SparseTensor, SparseTensor]:
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            return data[0], data[1]
+        elif isinstance(data, dict) and "view_a" in data and "view_b" in data:
+            if isinstance(data["view_a"], SparseTensor):
+                return data["view_a"], data["view_b"]
+
+        if HeteroData is not None and isinstance(data, HeteroData):
+            batch_a = getattr(data["view_a"], "batch", None)
+            if batch_a is None:
+                batch_a = torch.zeros(data["view_a"].x.size(0), dtype=torch.long, device=data["view_a"].x.device)
+            coords_a = torch.cat([batch_a.unsqueeze(1), data["view_a"].pos.long()], dim=1)
+            feats_a = data["view_a"].x[:, :self.in_channels]
+            tensor_a = SparseTensor(feats=feats_a, coords=coords_a)
+
+            batch_b = getattr(data["view_b"], "batch", None)
+            if batch_b is None:
+                batch_b = torch.zeros(data["view_b"].x.size(0), dtype=torch.long, device=data["view_b"].x.device)
+            coords_b = torch.cat([batch_b.unsqueeze(1), data["view_b"].pos.long()], dim=1)
+            feats_b = data["view_b"].x[:, :self.in_channels]
+            tensor_b = SparseTensor(feats=feats_b, coords=coords_b)
+
+            return tensor_a, tensor_b
+
+        raise TypeError("Unsupported data format for DualViewZipperSparseCNN.")
+
+    def forward(self, data) -> torch.Tensor:
+        tensor_a, tensor_b = self._extract_sparse_tensors(data)
+
+        x_a = self.block1_a(tensor_a)
+        x_b = self.block1_b(tensor_b)
+
+        x_a = self.block2_a(x_a)
+        x_b = self.block2_b(x_b)
+
+        batch_size = int(max(
+            x_a.C[:, 0].max().item() if x_a.C.numel() > 0 else 0,
+            x_b.C[:, 0].max().item() if x_b.C.numel() > 0 else 0
+        )) + 1
+        max_planes = self.spatial_shape[0]
+
+        # Extract per-plane 1D summaries along Z
+        summary_a, _ = _scatter_plane_summary(x_a.F, x_a.C[:, 0], x_a.C[:, 1], max_planes, num_batch=batch_size)
+        summary_b, _ = _scatter_plane_summary(x_b.F, x_b.C[:, 0], x_b.C[:, 1], max_planes, num_batch=batch_size)
+
+        seq_a = summary_a.view(batch_size, max_planes, -1) + self.pos_embed
+        seq_b = summary_b.view(batch_size, max_planes, -1) + self.pos_embed
+
+        # Zipper Interleave along Z: [A(0), B(0), A(1), B(1), ..., A(M-1), B(M-1)]
+        # Shape: (batch_size, 2 * max_planes, C)
+        zipped = torch.stack([seq_a, seq_b], dim=2).view(batch_size, 2 * max_planes, -1)
+
+        # Transpose to (batch_size, channels, length=2*max_planes) for Conv1d
+        zipped_t = zipped.transpose(1, 2)
+
+        # Pass through 1D Convolution Stack
+        conv1d_out = self.conv1d_stack(zipped_t)  # (batch_size, C_out, L_out)
+
+        # Global Pooling (Mean + Max across length)
+        mean_pooled = torch.mean(conv1d_out, dim=2)
+        max_pooled, _ = torch.max(conv1d_out, dim=2)
+        fused = torch.cat([mean_pooled, max_pooled], dim=1)
+
+        return self.classifier(fused)
+
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
 class MinimumViableMINOSGNN(nn.Module):
     """
     Small hetero-GNN for MINOS binary classification.
