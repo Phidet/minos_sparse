@@ -10,3 +10,8 @@ __pycache__/
 
 # Artifact & Log files
 *.log
+
+# Data & Extension files
+data/cache/
+*.vsix
+

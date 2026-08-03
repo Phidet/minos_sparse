@@ -8,10 +8,14 @@ from .torchsparse import SparseTensor
 from .dataset import (
     MINOSSingleViewDataset,
     sparse_uview_collate_fn,
-    create_uview_dataloaders
+    create_uview_dataloaders,
+    MINOSMultiViewGraphDataset,
+    create_multiview_gnn_dataloaders,
 )
 from .models import (
-    SimpleUViewSparseCNN
+    SimpleUViewSparseCNN,
+    MinimumViableMINOSGNN,
+    NuGraphInspiredBinaryGNN,
 )
 from .trainer import (
     train_epoch,
@@ -25,7 +29,11 @@ __all__ = [
     'MINOSSingleViewDataset',
     'sparse_uview_collate_fn',
     'create_uview_dataloaders',
+    'MINOSMultiViewGraphDataset',
+    'create_multiview_gnn_dataloaders',
     'SimpleUViewSparseCNN',
+    'MinimumViableMINOSGNN',
+    'NuGraphInspiredBinaryGNN',
     'train_epoch',
     'validate_epoch',
     'compute_metrics',
