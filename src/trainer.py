@@ -157,7 +157,9 @@ def compute_batch_loss(
 
 
 def _forward_batch(model: nn.Module, batch, device: torch.device):
+    model = model.to(device)
     energies = None
+    non_blocking = (device.type == "cuda")
 
     if isinstance(batch, tuple):
         if len(batch) == 4:
@@ -167,24 +169,24 @@ def _forward_batch(model: nn.Module, batch, device: torch.device):
         else:
             raise TypeError("Unsupported tuple batch length.")
 
-        coords = coords.to(device)
-        feats = feats.to(device)
-        labels = labels.to(device)
+        coords = coords.to(device, non_blocking=non_blocking)
+        feats = feats.to(device, non_blocking=non_blocking)
+        labels = labels.to(device, non_blocking=non_blocking)
         if energies is not None:
-            energies = energies.to(device)
+            energies = energies.to(device, non_blocking=non_blocking)
         input_tensor = SparseTensor(feats=feats, coords=coords)
         logits = model(input_tensor)
         return logits, labels, energies
 
     if HeteroData is not None and isinstance(batch, HeteroData):
-        batch = batch.to(device)
+        batch = batch.to(device, non_blocking=non_blocking)
         labels = batch.y
         energies = getattr(batch, "true_energy", None)
         logits = model(batch)
         return logits, labels, energies
 
     if hasattr(batch, "to") and hasattr(batch, "y"):
-        batch = batch.to(device)
+        batch = batch.to(device, non_blocking=non_blocking)
         labels = batch.y
         energies = getattr(batch, "true_energy", None)
         logits = model(batch)
@@ -206,6 +208,9 @@ def train_epoch(
     energy_epsilon: float = 0.5,
     energy_alpha: float = 1.0,
 ) -> Tuple[float, float]:
+    model = model.to(device)
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
     model.train()
     total_loss = 0.0
     all_preds = []
@@ -253,6 +258,9 @@ def validate_epoch(
     optimize_threshold: bool = True,
     threshold_metric: str = "f1",
 ) -> Tuple[float, float, Dict[str, float], np.ndarray, np.ndarray]:
+    model = model.to(device)
+    if class_weights is not None:
+        class_weights = class_weights.to(device)
     model.eval()
     total_loss = 0.0
     all_probs = []

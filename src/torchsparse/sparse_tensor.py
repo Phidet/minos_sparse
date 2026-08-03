@@ -15,7 +15,7 @@ class SparseTensor:
         self.spatial_range = spatial_range
 
     @property
-    def F() -> torch.Tensor:
+    def F(self) -> torch.Tensor:
         return self.feats
 
     @F.setter

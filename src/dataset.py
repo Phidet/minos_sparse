@@ -134,7 +134,13 @@ class MINOSSingleViewDataset(Dataset):
         return len(self.events)
 
     def __getitem__(self, idx: int) -> dict:
-        return self.events[idx]
+        item = self.events[idx]
+        return {
+            "coords": item["coords"].clone(),
+            "feats": item["feats"].clone(),
+            "label": item["label"].clone() if isinstance(item["label"], torch.Tensor) else torch.tensor(item["label"], dtype=torch.long),
+            "true_energy": item["true_energy"].clone() if isinstance(item["true_energy"], torch.Tensor) else torch.tensor(item["true_energy"], dtype=torch.float32),
+        }
 
     def get_class_weights(self, device: torch.device = torch.device("cpu")) -> torch.Tensor:
         labels = [e["label"].item() for e in self.events]
@@ -180,7 +186,9 @@ def create_uview_dataloaders(
     dataset: MINOSSingleViewDataset,
     batch_size: int = 32,
     val_split: float = 0.20,
-    random_seed: int = 42
+    random_seed: int = 42,
+    num_workers: int = 0,
+    pin_memory: bool = False,
 ) -> Tuple[DataLoader, DataLoader, List[int], List[int]]:
     total = len(dataset)
     val_size = int(total * val_split)
@@ -190,10 +198,20 @@ def create_uview_dataloaders(
     train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size], generator=generator)
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, collate_fn=sparse_uview_collate_fn
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=sparse_uview_collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, collate_fn=sparse_uview_collate_fn
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=sparse_uview_collate_fn,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
 
     return train_loader, val_loader, train_ds.indices, val_ds.indices
@@ -201,12 +219,11 @@ def create_uview_dataloaders(
 
 class MINOSMultiViewGraphDataset(Dataset):
     """
-    Minimum viable multi-view MINOS graph dataset for PyG.
+    Multi-view MINOS graph dataset for PyG.
 
     Each event becomes a heterograph with one node type per view and a shared
-    nexus node type keyed by plane coordinate. The graph is intentionally
-    simple and uses only tensor-based edge construction so it can serve as a
-    readable MVP baseline.
+    nexus node type keyed by plane coordinate. Supports standard radius edge
+    construction and Delaunay/KNN mesh edge construction.
     """
 
     def __init__(
@@ -216,6 +233,7 @@ class MINOSMultiViewGraphDataset(Dataset):
         view_ids: Optional[Sequence[int]] = None,
         plane_radius: int = 1,
         strip_radius: int = 2,
+        graph_mode: str = "radius",
         cache_path: Optional[str] = None,
         allow_root_fallback: bool = True,
     ):
@@ -224,6 +242,7 @@ class MINOSMultiViewGraphDataset(Dataset):
         self.root_filepath = Path(root_filepath)
         self.plane_radius = int(plane_radius)
         self.strip_radius = int(strip_radius)
+        self.graph_mode = str(graph_mode)
         self.events = []
 
         cache_file = Path(cache_path) if cache_path is not None else None
@@ -243,6 +262,7 @@ class MINOSMultiViewGraphDataset(Dataset):
             self.view_ids = cached_view_ids
             self.plane_radius = int(cache.get("plane_radius", self.plane_radius))
             self.strip_radius = int(cache.get("strip_radius", self.strip_radius))
+            self.graph_mode = str(cache.get("graph_mode", self.graph_mode))
             self.events = cache["events"]
             return
 
@@ -326,6 +346,7 @@ class MINOSMultiViewGraphDataset(Dataset):
                     "view_ids": self.view_ids,
                     "plane_radius": self.plane_radius,
                     "strip_radius": self.strip_radius,
+                    "graph_mode": self.graph_mode,
                     "max_events": max_events,
                     "events": self.events,
                 },
@@ -365,6 +386,36 @@ class MINOSMultiViewGraphDataset(Dataset):
 
         edge_index = adjacency.nonzero(as_tuple=False).t().contiguous()
         return edge_index
+
+    def _delaunay_knn_edges(
+        self,
+        coords: np.ndarray,
+        max_plane_diff: int = 3,
+        max_strip_diff: int = 8,
+    ) -> torch.Tensor:
+        if coords.shape[0] < 2:
+            return torch.empty((2, 0), dtype=torch.long)
+        if coords.shape[0] < 4:
+            return self._dense_edges(coords)
+
+        try:
+            from scipy.spatial import Delaunay
+            tri = Delaunay(coords)
+            edges_set = set()
+            for simplex in tri.simplices:
+                for u, v in [(simplex[0], simplex[1]), (simplex[1], simplex[2]), (simplex[2], simplex[0])]:
+                    if u != v:
+                        p_diff = abs(int(coords[u, 0]) - int(coords[v, 0]))
+                        s_diff = abs(int(coords[u, 1]) - int(coords[v, 1]))
+                        if p_diff <= max_plane_diff and s_diff <= max_strip_diff:
+                            edges_set.add((u, v))
+                            edges_set.add((v, u))
+            if not edges_set:
+                return self._dense_edges(coords)
+            edges_arr = np.array(list(edges_set), dtype=np.int64).T
+            return torch.tensor(edges_arr, dtype=torch.long)
+        except Exception:
+            return self._dense_edges(coords)
 
     def _build_event_graph(
         self,
@@ -414,7 +465,11 @@ class MINOSMultiViewGraphDataset(Dataset):
             data[node_type].strip = torch.tensor(node_strips, dtype=torch.long)
             data[node_type].pos = torch.tensor(coords, dtype=torch.long)
 
-            same_view_edges = self._dense_edges(coords)
+            if self.graph_mode == "delaunay_knn":
+                same_view_edges = self._delaunay_knn_edges(coords)
+            else:
+                same_view_edges = self._dense_edges(coords)
+
             data[(node_type, "same_view", node_type)].edge_index = same_view_edges
 
             if coords.shape[0] > 0:
@@ -436,11 +491,17 @@ class MINOSMultiViewGraphDataset(Dataset):
         data.true_energy = torch.tensor(true_energy, dtype=torch.float32)
         return data
 
+
     def __len__(self) -> int:
         return len(self.events)
 
     def __getitem__(self, idx: int):
-        return self.events[idx]
+        event = self.events[idx]
+        if hasattr(event, "to"):
+            event = event.to("cpu")
+        if hasattr(event, "clone"):
+            return event.clone()
+        return event
 
     def get_class_weights(self, device: torch.device = torch.device("cpu")) -> torch.Tensor:
         labels = [e.y.item() for e in self.events]
@@ -457,6 +518,8 @@ def create_multiview_gnn_dataloaders(
     batch_size: int = 32,
     val_split: float = 0.20,
     random_seed: int = 42,
+    num_workers: int = 0,
+    pin_memory: bool = False,
 ) -> Tuple[DataLoader, DataLoader, List[int], List[int]]:
     if PyGDataLoader is None:
         raise ImportError(
@@ -470,7 +533,19 @@ def create_multiview_gnn_dataloaders(
     generator = torch.Generator().manual_seed(random_seed)
     train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size], generator=generator)
 
-    train_loader = PyGDataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = PyGDataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    train_loader = PyGDataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = PyGDataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
 
     return train_loader, val_loader, train_ds.indices, val_ds.indices
