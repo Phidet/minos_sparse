@@ -323,6 +323,7 @@ def train_model(
     energy_alpha: float = 1.0,
     optimize_threshold: bool = True,
     threshold_metric: str = "f1",
+    selection_metric: str = "roc_auc",
     device: torch.device = torch.device("cpu"),
     verbose: bool = True
 ) -> Tuple[Dict[str, list], Dict[str, float]]:
@@ -343,12 +344,15 @@ def train_model(
     }
 
     start_time = time.time()
-    best_f1 = -1.0
+    target_metric = (selection_metric or "roc_auc").lower()
+    best_score = float("inf") if target_metric in ["val_loss", "loss"] else -1.0
     best_metrics = {}
     best_state_dict = None
 
     if verbose:
         print(f"Starting model training on {device} ({num_epochs} epochs)...")
+        print(f"Best Model Selection Metric: '{target_metric}'")
+
         if use_energy_weighting:
             print(f"Inverse Energy Reweighting Enabled: w(E_nu) = 1/(E_nu + {energy_epsilon})^{energy_alpha} (batch normalized)")
         if optimize_threshold:
@@ -380,10 +384,25 @@ def train_model(
         history["val_threshold"].append(val_metrics["threshold"])
         history["lr"].append(current_lr)
 
-        if val_metrics["f1"] > best_f1:
-            best_f1 = val_metrics["f1"]
+        # Determine metric for model selection
+        if target_metric in ["roc_auc", "auc"]:
+            current_score = val_metrics["roc_auc"]
+            is_better = current_score > best_score
+        elif target_metric in ["accuracy", "acc"]:
+            current_score = val_acc
+            is_better = current_score > best_score
+        elif target_metric in ["val_loss", "loss"]:
+            current_score = val_loss
+            is_better = current_score < best_score
+        else:  # default "f1"
+            current_score = val_metrics["f1"]
+            is_better = current_score > best_score
+
+        if is_better:
+            best_score = current_score
             best_metrics = val_metrics.copy()
             best_metrics["val_loss"] = val_loss
+            best_metrics["best_epoch"] = epoch
             best_state_dict = copy.deepcopy(model.state_dict())
 
         if verbose:
@@ -397,15 +416,21 @@ def train_model(
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
 
+    peak_auc = max(history["val_auc"]) if history["val_auc"] else 0.0
+    best_metrics["peak_auc"] = peak_auc
+
     elapsed = time.time() - start_time
     if verbose:
         print(
             f"Training finished in {elapsed:.2f} s. "
-            f"Best Val F1: {best_f1:.4f} | Best AUC: {best_metrics.get('roc_auc', 0.0):.4f} | "
+            f"Best Epoch: {best_metrics.get('best_epoch', epoch):02d} (Selected by '{target_metric}') | "
+            f"Val F1: {best_metrics.get('f1', 0.0):.4f} | "
+            f"Val AUC: {best_metrics.get('roc_auc', 0.0):.4f} (Peak AUC: {peak_auc:.4f}) | "
             f"Optimal Threshold: {best_metrics.get('threshold', 0.5):.3f}"
         )
 
     return history, best_metrics
+
 
 
 def auto_commit_and_get_hash(commit_msg: Optional[str] = None) -> str:
