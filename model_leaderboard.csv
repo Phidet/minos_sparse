@@ -2,3 +2,4 @@ timestamp,git_hash,model_type,model_name,roc_auc,f1,accuracy,val_loss,threshold,
 2026-08-04 14:46:39,1bf73d4,cnn_dualview,DualViewSparseCNN,0.9287,0.9113,0.8614,0.3283,0.241,12,32,0.001,dual_ph,12000,saved_models/cnn_dualview_20260804_144639_1bf73d4.pt
 2026-08-04 14:53:52,a982474,cnn_dualview,DualViewSparseCNN,0.9307,0.912,0.8614,0.3293,0.227,12,32,0.001,sum,12000,saved_models/cnn_dualview_20260804_145352_a982474.pt
 2026-08-04 15:00:47,d55b4c3,cnn_simplified_dualview,SimplifiedDualViewSparseCNN,0.9273,0.9106,0.8563,0.3276,0.202,12,32,0.001,sum,12000,saved_models/cnn_simplified_dualview_20260804_150047_d55b4c3.pt
+2026-08-04 15:07:27,3a919d2,cnn_cross_attention,DualViewCrossAttentionSparseCNN,0.9292,0.9075,0.8533,0.3059,0.207,12,32,0.001,sum,12000,saved_models/cnn_cross_attention_20260804_150727_3a919d2.pt
