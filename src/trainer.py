@@ -1,6 +1,13 @@
 import time
+import os
+import copy
+import csv
+import subprocess
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any, Tuple, Optional
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -338,6 +345,7 @@ def train_model(
     start_time = time.time()
     best_f1 = -1.0
     best_metrics = {}
+    best_state_dict = None
 
     if verbose:
         print(f"Starting model training on {device} ({num_epochs} epochs)...")
@@ -376,6 +384,7 @@ def train_model(
             best_f1 = val_metrics["f1"]
             best_metrics = val_metrics.copy()
             best_metrics["val_loss"] = val_loss
+            best_state_dict = copy.deepcopy(model.state_dict())
 
         if verbose:
             print(
@@ -384,6 +393,9 @@ def train_model(
                 f"Val Loss (w): {val_loss:.4f} Acc: {val_acc*100:.2f}% "
                 f"F1: {val_metrics['f1']:.4f} AUC: {val_metrics['roc_auc']:.4f} Thresh: {val_metrics['threshold']:.3f}"
             )
+
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
 
     elapsed = time.time() - start_time
     if verbose:
@@ -394,5 +406,174 @@ def train_model(
         )
 
     return history, best_metrics
+
+
+def auto_commit_and_get_hash(commit_msg: Optional[str] = None) -> str:
+    """
+    Checks if the workspace has uncommitted git changes. If so, automatically stages
+    and commits them with a timestamped message. Returns the current short git hash.
+    """
+    try:
+        is_git = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True
+        )
+        if is_git.returncode != 0:
+            print("Git repository not detected. Returning default hash.")
+            return "no-git-repo"
+
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True
+        )
+        if status.stdout.strip():
+            msg = commit_msg or f"Auto-commit before training ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})"
+            subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", msg], check=True, capture_output=True)
+            print(f"Git auto-commit created: {msg}")
+
+        git_hash = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, check=True
+        ).stdout.strip()
+        print(f"Git commit hash: {git_hash}")
+        return git_hash
+    except Exception as e:
+        print(f"Git auto-commit note: {e}")
+        try:
+            res = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True
+            )
+            h = res.stdout.strip()
+            return h if h else "git-error"
+        except Exception:
+            return "git-error"
+
+
+def save_model_checkpoint(
+    model: nn.Module,
+    config: Dict[str, Any],
+    best_metrics: Dict[str, float],
+    git_hash: str,
+    save_dir: str = "saved_models"
+) -> str:
+    """
+    Saves the trained PyTorch model state_dict along with configuration metadata and metrics.
+    Returns the path to the saved checkpoint file.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    model_type = config.get("model_type", "model")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{model_type}_{timestamp}_{git_hash}.pt"
+    filepath = os.path.join(save_dir, filename)
+
+    checkpoint = {
+        "model_type": model_type,
+        "model_state_dict": model.state_dict(),
+        "config": config,
+        "best_metrics": best_metrics,
+        "git_hash": git_hash,
+        "timestamp": datetime.now().isoformat(),
+    }
+    torch.save(checkpoint, filepath)
+    print(f"Saved trained model checkpoint to: {filepath}")
+    return filepath
+
+
+def log_experiment(
+    config: Dict[str, Any],
+    model_name: str,
+    best_metrics: Dict[str, float],
+    git_hash: str,
+    model_path: str,
+    csv_path: str = "model_leaderboard.csv"
+) -> pd.DataFrame:
+    """
+    Appends experiment metrics and hyperparameters to a CSV leaderboard file.
+    """
+    fieldnames = [
+        "timestamp",
+        "git_hash",
+        "model_type",
+        "model_name",
+        "roc_auc",
+        "f1",
+        "accuracy",
+        "val_loss",
+        "threshold",
+        "num_epochs",
+        "batch_size",
+        "lr",
+        "feature_mode",
+        "max_events",
+        "model_path",
+    ]
+
+    row = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "git_hash": git_hash,
+        "model_type": config.get("model_type", "unknown"),
+        "model_name": model_name,
+        "roc_auc": round(float(best_metrics.get("roc_auc", 0.0)), 4),
+        "f1": round(float(best_metrics.get("f1", 0.0)), 4),
+        "accuracy": round(float(best_metrics.get("accuracy", 0.0)), 4),
+        "val_loss": round(float(best_metrics.get("val_loss", 0.0)), 4),
+        "threshold": round(float(best_metrics.get("threshold", 0.5)), 3),
+        "num_epochs": config.get("num_epochs", 0),
+        "batch_size": config.get("batch_size", 0),
+        "lr": config.get("lr", 0.0),
+        "feature_mode": config.get("feature_mode", "dual_ph"),
+        "max_events": config.get("max_events", "all"),
+        "model_path": model_path,
+    }
+
+    file_exists = os.path.exists(csv_path)
+    with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+    print(f"Logged experiment metrics to leaderboard: {csv_path}")
+    return pd.read_csv(csv_path)
+
+
+def display_leaderboard(
+    csv_path: str = "model_leaderboard.csv",
+    rank_by: str = "roc_auc",
+    ascending: bool = False
+) -> pd.DataFrame:
+    """
+    Reads the leaderboard CSV file, sorts models by the chosen metric,
+    and displays/returns the ranked table.
+    """
+    if not os.path.exists(csv_path):
+        print(f"No leaderboard CSV found at {csv_path} yet.")
+        return pd.DataFrame()
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        print("Leaderboard is empty.")
+        return df
+
+    if rank_by not in df.columns:
+        print(f"Warning: Metric '{rank_by}' not in leaderboard columns ({list(df.columns)}). Defaulting to 'roc_auc'.")
+        rank_by = "roc_auc"
+
+    df_sorted = df.sort_values(by=rank_by, ascending=ascending).reset_index(drop=True)
+    df_sorted.index = df_sorted.index + 1
+    df_sorted.index.name = "Rank"
+
+    print(f"\n=================== MODEL LEADERBOARD (Ranked by {rank_by.upper()}) ===================")
+
+    try:
+        from IPython.display import display
+        display(df_sorted)
+    except ImportError:
+        print(df_sorted.to_string())
+
+    return df_sorted
+
 
 

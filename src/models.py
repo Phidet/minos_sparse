@@ -177,6 +177,147 @@ class DualViewSparseCNN(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class DualViewDenseCNN(nn.Module):
+    """
+    Dual-View Dense 2D CNN for MINOS binary classification.
+
+    Rasterizes MINOS detector hits into dense 2D image tensors [Batch, Channels, 486, 192]
+    for both detector views (e.g., U-view and V-view). Each view is processed by a standard
+    2D CNN backbone (nn.Conv2d, nn.BatchNorm2d, nn.ReLU, nn.MaxPool2d), pooled via
+    nn.AdaptiveAvgPool2d((1, 1)), and fused in a fully connected classification readout.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        conv_channels: List[int] = [16, 32],
+        fc_dims: List[int] = [16],
+        num_classes: int = 2,
+        dropout: float = 0.1,
+        spatial_shape: Tuple[int, int] = (486, 192)
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.conv_channels = conv_channels
+        self.spatial_shape = spatial_shape
+
+        # View A 2D CNN backbone
+        net_a_layers = []
+        prev_c = in_channels
+        for out_c in conv_channels:
+            net_a_layers.append(nn.Conv2d(prev_c, out_c, kernel_size=3, padding=1))
+            net_a_layers.append(nn.BatchNorm2d(out_c))
+            net_a_layers.append(nn.ReLU())
+            net_a_layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+            prev_c = out_c
+        self.net_a = nn.Sequential(*net_a_layers)
+
+        # View B 2D CNN backbone
+        net_b_layers = []
+        prev_c = in_channels
+        for out_c in conv_channels:
+            net_b_layers.append(nn.Conv2d(prev_c, out_c, kernel_size=3, padding=1))
+            net_b_layers.append(nn.BatchNorm2d(out_c))
+            net_b_layers.append(nn.ReLU())
+            net_b_layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+            prev_c = out_c
+        self.net_b = nn.Sequential(*net_b_layers)
+
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        pooled_dim = conv_channels[-1] if len(conv_channels) > 0 else in_channels
+        fusion_dim = pooled_dim * 4
+
+        classifier_layers = []
+        current_dim = fusion_dim
+        for fc_dim in fc_dims:
+            classifier_layers.append(nn.Linear(current_dim, fc_dim))
+            classifier_layers.append(nn.ReLU())
+            if dropout > 0.0:
+                classifier_layers.append(nn.Dropout(dropout))
+            current_dim = fc_dim
+
+        classifier_layers.append(nn.Linear(current_dim, num_classes))
+        self.classifier = nn.Sequential(*classifier_layers)
+
+    def _extract_dense_images(self, data) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Extracts view_a and view_b coordinates and features, returning dense
+        2D image tensors of shape [Batch, Channels, H, W].
+        """
+        H, W = self.spatial_shape
+
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            tensor_a, tensor_b = data[0], data[1]
+            coords_a, feats_a = tensor_a.C, tensor_a.F
+            coords_b, feats_b = tensor_b.C, tensor_b.F
+            batch_size = int(max(coords_a[:, 0].max().item(), coords_b[:, 0].max().item())) + 1 if coords_a.numel() > 0 or coords_b.numel() > 0 else 1
+        elif isinstance(data, dict) and "view_a" in data and "view_b" in data:
+            if isinstance(data["view_a"], SparseTensor):
+                tensor_a, tensor_b = data["view_a"], data["view_b"]
+                coords_a, feats_a = tensor_a.C, tensor_a.F
+                coords_b, feats_b = tensor_b.C, tensor_b.F
+                batch_size = int(max(coords_a[:, 0].max().item(), coords_b[:, 0].max().item())) + 1 if coords_a.numel() > 0 or coords_b.numel() > 0 else 1
+            else:
+                raise TypeError("Unsupported dict input type for DualViewDenseCNN.")
+        elif HeteroData is not None and isinstance(data, HeteroData):
+            batch_a = getattr(data["view_a"], "batch", None)
+            if batch_a is None:
+                batch_a = torch.zeros(data["view_a"].x.size(0), dtype=torch.long, device=data["view_a"].x.device)
+            coords_a = torch.cat([batch_a.unsqueeze(1), data["view_a"].pos.long()], dim=1)
+            feats_a = data["view_a"].x[:, :self.in_channels]
+
+            batch_b = getattr(data["view_b"], "batch", None)
+            if batch_b is None:
+                batch_b = torch.zeros(data["view_b"].x.size(0), dtype=torch.long, device=data["view_b"].x.device)
+            coords_b = torch.cat([batch_b.unsqueeze(1), data["view_b"].pos.long()], dim=1)
+            feats_b = data["view_b"].x[:, :self.in_channels]
+
+            if hasattr(data, "num_graphs") and data.num_graphs is not None:
+                batch_size = data.num_graphs
+            elif hasattr(data, "y") and data.y is not None:
+                batch_size = data.y.size(0)
+            else:
+                max_a = int(batch_a.max().item()) + 1 if batch_a.numel() > 0 else 1
+                max_b = int(batch_b.max().item()) + 1 if batch_b.numel() > 0 else 1
+                batch_size = max(max_a, max_b)
+        else:
+            raise TypeError("Unsupported data format for DualViewDenseCNN. Expected HeteroData or tuple/dict of SparseTensors.")
+
+        dense_a = self._coords_to_dense(coords_a, feats_a, batch_size, H, W)
+        dense_b = self._coords_to_dense(coords_b, feats_b, batch_size, H, W)
+        return dense_a, dense_b
+
+    def _coords_to_dense(self, coords: torch.Tensor, feats: torch.Tensor, batch_size: int, H: int, W: int) -> torch.Tensor:
+        dense = torch.zeros((batch_size, self.in_channels, H, W), dtype=feats.dtype, device=feats.device)
+        if coords.numel() > 0 and feats.numel() > 0:
+            b_idx = coords[:, 0]
+            h_idx = torch.clamp(coords[:, 1], 0, H - 1)
+            w_idx = torch.clamp(coords[:, 2], 0, W - 1)
+            dense[b_idx, :, h_idx, w_idx] = feats[:, :self.in_channels]
+        return dense
+
+    def forward(self, data) -> torch.Tensor:
+        dense_a, dense_b = self._extract_dense_images(data)
+
+        x_a = self.net_a(dense_a)
+        pooled_a = self.pool(x_a).flatten(1)
+
+        x_b = self.net_b(dense_b)
+        pooled_b = self.pool(x_b).flatten(1)
+
+        fused = torch.cat([
+            pooled_a,
+            pooled_b,
+            torch.abs(pooled_a - pooled_b),
+            pooled_a * pooled_b,
+        ], dim=-1)
+
+        return self.classifier(fused)
+
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
 def _scatter_plane_summary(feats: torch.Tensor, batch_idx: torch.Tensor, plane_idx: torch.Tensor, max_planes: int = 486, num_batch: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """Computes a per-(batch, plane) mean feature vector without external dependencies."""
     plane_keys = batch_idx * max_planes + plane_idx
@@ -1311,8 +1452,8 @@ class DualViewZipperSparseCNN(nn.Module):
         self,
         in_channels: int = 1,
         conv_channels: List[int] = [16, 32],
-        conv1d_channels: List[int] = [32, 64],
-        fc_dims: List[int] = [32],
+        conv1d_channels: List[int] = [32],
+        fc_dims: List[int] = [8, 4, 2],
         num_classes: int = 2,
         dropout: float = 0.1,
         spatial_shape: Tuple[int, int] = (486, 192)

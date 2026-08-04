@@ -15,6 +15,7 @@ from .dataset import (
 from .models import (
     SimpleUViewSparseCNN,
     DualViewSparseCNN,
+    DualViewDenseCNN,
     DualViewPlaneSummarySparseCNN,
     DualViewCrossAttentionSparseCNN,
     DualView3DIntersectionSparseCNN,
@@ -30,7 +31,11 @@ from .trainer import (
     train_epoch,
     validate_epoch,
     compute_metrics,
-    train_model
+    train_model,
+    auto_commit_and_get_hash,
+    save_model_checkpoint,
+    log_experiment,
+    display_leaderboard,
 )
 
 __all__ = [
@@ -42,6 +47,7 @@ __all__ = [
     'create_multiview_gnn_dataloaders',
     'SimpleUViewSparseCNN',
     'DualViewSparseCNN',
+    'DualViewDenseCNN',
     'DualViewPlaneSummarySparseCNN',
     'DualViewCrossAttentionSparseCNN',
     'DualView3DIntersectionSparseCNN',
@@ -55,5 +61,10 @@ __all__ = [
     'train_epoch',
     'validate_epoch',
     'compute_metrics',
-    'train_model'
+    'train_model',
+    'auto_commit_and_get_hash',
+    'save_model_checkpoint',
+    'log_experiment',
+    'display_leaderboard',
 ]
+

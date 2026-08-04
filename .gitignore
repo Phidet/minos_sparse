@@ -15,3 +15,7 @@ __pycache__/
 data/cache/
 *.vsix
 
+# Saved Models
+saved_models/*.pt
+
+
