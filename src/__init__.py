@@ -15,6 +15,7 @@ from .dataset import (
 from .models import (
     SimpleUViewSparseCNN,
     DualViewSparseCNN,
+    SimplifiedDualViewSparseCNN,
     DualViewDenseCNN,
     DualViewPlaneSummarySparseCNN,
     DualViewCrossAttentionSparseCNN,
@@ -47,6 +48,7 @@ __all__ = [
     'create_multiview_gnn_dataloaders',
     'SimpleUViewSparseCNN',
     'DualViewSparseCNN',
+    'SimplifiedDualViewSparseCNN',
     'DualViewDenseCNN',
     'DualViewPlaneSummarySparseCNN',
     'DualViewCrossAttentionSparseCNN',
@@ -67,4 +69,5 @@ __all__ = [
     'log_experiment',
     'display_leaderboard',
 ]
+
 

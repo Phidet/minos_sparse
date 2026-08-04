@@ -177,6 +177,105 @@ class DualViewSparseCNN(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class SimplifiedDualViewSparseCNN(nn.Module):
+    """
+    Simplified Dual-View Sparse CNN for MINOS binary classification.
+
+    Processes two detector views (e.g., U-view and V-view) using a single shared
+    TorchSparse SubMConv2d feature extraction backbone (`self.net`). Each view's
+    spatial features are extracted by `self.net` and pooled via `self.pool` (GlobalAvgPooling).
+    The resulting view embeddings are combined in a shared fully connected classification readout.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        conv_channels: List[int] = [16, 32],
+        fc_dims: List[int] = [16],
+        num_classes: int = 2,
+        dropout: float = 0.1,
+        spatial_shape: Tuple[int, int] = (486, 192)
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.conv_channels = conv_channels
+
+        self.net = nn.ModuleList()
+        prev_c = in_channels
+        for out_c in conv_channels:
+            self.net.append(spnn.SubMConv2d(prev_c, out_c, kernel_size=3, spatial_shape=spatial_shape))
+            self.net.append(spnn.BatchNorm(out_c))
+            self.net.append(spnn.ReLU())
+            prev_c = out_c
+
+        self.pool = spnn.GlobalAvgPooling()
+        pooled_dim = conv_channels[-1] if len(conv_channels) > 0 else in_channels
+        fusion_dim = pooled_dim * 4
+
+        classifier_layers = []
+        current_dim = fusion_dim
+        for fc_dim in fc_dims:
+            classifier_layers.append(nn.Linear(current_dim, fc_dim))
+            classifier_layers.append(nn.ReLU())
+            if dropout > 0.0:
+                classifier_layers.append(nn.Dropout(dropout))
+            current_dim = fc_dim
+
+        classifier_layers.append(nn.Linear(current_dim, num_classes))
+        self.classifier = nn.Sequential(*classifier_layers)
+
+    def _extract_sparse_tensors(self, data) -> Tuple[SparseTensor, SparseTensor]:
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            return data[0], data[1]
+        elif isinstance(data, dict) and "view_a" in data and "view_b" in data:
+            if isinstance(data["view_a"], SparseTensor):
+                return data["view_a"], data["view_b"]
+
+        if HeteroData is not None and isinstance(data, HeteroData):
+            batch_a = getattr(data["view_a"], "batch", None)
+            if batch_a is None:
+                batch_a = torch.zeros(data["view_a"].x.size(0), dtype=torch.long, device=data["view_a"].x.device)
+            coords_a = torch.cat([batch_a.unsqueeze(1), data["view_a"].pos.long()], dim=1)
+            feats_a = data["view_a"].x[:, :self.in_channels]
+            tensor_a = SparseTensor(feats=feats_a, coords=coords_a)
+
+            batch_b = getattr(data["view_b"], "batch", None)
+            if batch_b is None:
+                batch_b = torch.zeros(data["view_b"].x.size(0), dtype=torch.long, device=data["view_b"].x.device)
+            coords_b = torch.cat([batch_b.unsqueeze(1), data["view_b"].pos.long()], dim=1)
+            feats_b = data["view_b"].x[:, :self.in_channels]
+            tensor_b = SparseTensor(feats=feats_b, coords=coords_b)
+
+            return tensor_a, tensor_b
+
+        raise TypeError("Unsupported data format for SimplifiedDualViewSparseCNN. Expected HeteroData or tuple of SparseTensors.")
+
+    def forward(self, data) -> torch.Tensor:
+        tensor_a, tensor_b = self._extract_sparse_tensors(data)
+
+        x_a = tensor_a
+        for layer in self.net:
+            x_a = layer(x_a)
+        pooled_a = self.pool(x_a)
+
+        x_b = tensor_b
+        for layer in self.net:
+            x_b = layer(x_b)
+        pooled_b = self.pool(x_b)
+
+        fused = torch.cat([
+            pooled_a,
+            pooled_b,
+            torch.abs(pooled_a - pooled_b),
+            pooled_a * pooled_b,
+        ], dim=-1)
+
+        return self.classifier(fused)
+
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
 class DualViewDenseCNN(nn.Module):
     """
     Dual-View Dense 2D CNN for MINOS binary classification.
