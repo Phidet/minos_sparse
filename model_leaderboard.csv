@@ -8,3 +8,4 @@ timestamp,git_hash,model_type,model_name,roc_auc,f1,accuracy,val_loss,threshold,
 2026-08-04 15:34:45,e8df380,cnn_positional_cross_attention,DualViewPositionalCrossAttentionSparseCNN,0.9293,0.9121,0.8653,0.2739,0.507,12,32,0.001,sum,12000,saved_models/cnn_positional_cross_attention_20260804_153445_e8df380.pt
 2026-08-04 15:42:16,eae11e0,cnn_multistage_cross_attention,DualViewMultiStageCrossAttentionSparseCNN,0.9281,0.9097,0.8576,0.2723,0.448,12,32,0.001,sum,12000,saved_models/cnn_multistage_cross_attention_20260804_154216_eae11e0.pt
 2026-08-04 15:51:32,a245a70,cnn_simplified_cross_attention,SimplifiedDualViewCrossAttentionSparseCNN,0.93,0.911,0.8597,0.2737,0.434,12,32,0.001,sum,12000,saved_models/cnn_simplified_cross_attention_20260804_155132_a245a70.pt
+2026-08-04 15:55:55,9a08197,cnn,SimpleUViewSparseCNN,0.8628,0.8968,0.8328,0.38,0.453,12,32,0.001,sum,12000,saved_models/cnn_20260804_155555_9a08197.pt
