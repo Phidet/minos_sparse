@@ -20,6 +20,7 @@ from .models import (
     DualViewPlaneSummarySparseCNN,
     DualViewCrossAttentionSparseCNN,
     DualViewDeepCrossAttentionSparseCNN,
+    DualViewTransformerCrossAttnSparseCNN,
     SimplifiedDualViewCrossAttentionSparseCNN,
     DualViewPositionalCrossAttentionSparseCNN,
     DualViewMultiStageCrossAttentionSparseCNN,
@@ -57,6 +58,7 @@ __all__ = [
     'DualViewPlaneSummarySparseCNN',
     'DualViewCrossAttentionSparseCNN',
     'DualViewDeepCrossAttentionSparseCNN',
+    'DualViewTransformerCrossAttnSparseCNN',
     'SimplifiedDualViewCrossAttentionSparseCNN',
     'DualViewPositionalCrossAttentionSparseCNN',
     'DualViewMultiStageCrossAttentionSparseCNN',
@@ -77,6 +79,7 @@ __all__ = [
     'log_experiment',
     'display_leaderboard',
 ]
+
 
 
 
