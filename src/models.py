@@ -2958,5 +2958,514 @@ class NuGraphInspiredBinaryGNN(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+def _sparse_global_max_pooling(x: SparseTensor) -> torch.Tensor:
+    batch_idx = x.C[:, 0]
+    batch_size = int(batch_idx.max().item()) + 1 if x.C.numel() > 0 else 1
+    num_feats = x.F.size(1)
+    max_pooled = torch.full((batch_size, num_feats), fill_value=-1e9, device=x.F.device, dtype=x.F.dtype)
+    max_pooled.scatter_reduce_(0, batch_idx.unsqueeze(1).expand(-1, num_feats), x.F, reduce="max")
+    max_pooled = torch.where(max_pooled == -1e9, torch.zeros_like(max_pooled), max_pooled)
+    return max_pooled
+
+
+class DualViewDeepResNetCrossAttentionSparseCNN(nn.Module):
+    """
+    3-Stage Deep Dual-View Sparse ResNet with Intermediate 1D Cross-Attention.
+    Combines 3-stage feature depth [32, 64, 128] with residual skip-connections (SparseResBlock)
+    in all 3 stages for deep gradient stability and rich spatial representations.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        conv_channels: List[int] = [32, 64, 128],
+        fc_dims: List[int] = [32, 16],
+        num_classes: int = 2,
+        dropout: float = 0.1,
+        num_heads: int = 8,
+        spatial_shape: Tuple[int, int] = (486, 192)
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.conv_channels = conv_channels
+        self.spatial_shape = spatial_shape
+
+        c1 = conv_channels[0] if len(conv_channels) > 0 else 32
+        c2 = conv_channels[1] if len(conv_channels) > 1 else c1
+        c3 = conv_channels[2] if len(conv_channels) > 2 else c2
+
+        # Stage 1 + ResBlock
+        self.block1_a = nn.Sequential(
+            spnn.SubMConv2d(in_channels, c1, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c1),
+            spnn.ReLU(),
+            SparseResBlock(c1, spatial_shape=spatial_shape)
+        )
+        self.block1_b = nn.Sequential(
+            spnn.SubMConv2d(in_channels, c1, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c1),
+            spnn.ReLU(),
+            SparseResBlock(c1, spatial_shape=spatial_shape)
+        )
+
+        # Cross-Attention Stage 1
+        self.cross_attn_a = nn.MultiheadAttention(embed_dim=c1, num_heads=num_heads, batch_first=True)
+        self.cross_attn_b = nn.MultiheadAttention(embed_dim=c1, num_heads=num_heads, batch_first=True)
+        self.norm_a = nn.LayerNorm(c1)
+        self.norm_b = nn.LayerNorm(c1)
+
+        # Stage 2 + ResBlock
+        self.block2_a = nn.Sequential(
+            spnn.SubMConv2d(c1, c2, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c2),
+            spnn.ReLU(),
+            SparseResBlock(c2, spatial_shape=spatial_shape)
+        )
+        self.block2_b = nn.Sequential(
+            spnn.SubMConv2d(c1, c2, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c2),
+            spnn.ReLU(),
+            SparseResBlock(c2, spatial_shape=spatial_shape)
+        )
+
+        # Stage 3 + ResBlock
+        self.block3_a = nn.Sequential(
+            spnn.SubMConv2d(c2, c3, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c3),
+            spnn.ReLU(),
+            SparseResBlock(c3, spatial_shape=spatial_shape)
+        )
+        self.block3_b = nn.Sequential(
+            spnn.SubMConv2d(c2, c3, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c3),
+            spnn.ReLU(),
+            SparseResBlock(c3, spatial_shape=spatial_shape)
+        )
+
+        self.pool = spnn.GlobalAvgPooling()
+        pooled_dim = c3
+        fusion_dim = pooled_dim * 4
+
+        classifier_layers = []
+        current_dim = fusion_dim
+        for fc_dim in fc_dims:
+            classifier_layers.append(nn.Linear(current_dim, fc_dim))
+            classifier_layers.append(nn.ReLU())
+            if dropout > 0.0:
+                classifier_layers.append(nn.Dropout(dropout))
+            current_dim = fc_dim
+
+        classifier_layers.append(nn.Linear(current_dim, num_classes))
+        self.classifier = nn.Sequential(*classifier_layers)
+
+    def _extract_sparse_tensors(self, data) -> Tuple[SparseTensor, SparseTensor]:
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            return data[0], data[1]
+        elif isinstance(data, dict) and "view_a" in data and "view_b" in data:
+            if isinstance(data["view_a"], SparseTensor):
+                return data["view_a"], data["view_b"]
+
+        if HeteroData is not None and isinstance(data, HeteroData):
+            batch_a = getattr(data["view_a"], "batch", None)
+            if batch_a is None:
+                batch_a = torch.zeros(data["view_a"].x.size(0), dtype=torch.long, device=data["view_a"].x.device)
+            coords_a = torch.cat([batch_a.unsqueeze(1), data["view_a"].pos.long()], dim=1)
+            feats_a = data["view_a"].x[:, :self.in_channels]
+            tensor_a = SparseTensor(feats=feats_a, coords=coords_a)
+
+            batch_b = getattr(data["view_b"], "batch", None)
+            if batch_b is None:
+                batch_b = torch.zeros(data["view_b"].x.size(0), dtype=torch.long, device=data["view_b"].x.device)
+            coords_b = torch.cat([batch_b.unsqueeze(1), data["view_b"].pos.long()], dim=1)
+            feats_b = data["view_b"].x[:, :self.in_channels]
+            tensor_b = SparseTensor(feats=feats_b, coords=coords_b)
+
+            return tensor_a, tensor_b
+
+        raise TypeError("Unsupported data format for DualViewDeepResNetCrossAttentionSparseCNN.")
+
+    def forward(self, data) -> torch.Tensor:
+        tensor_a, tensor_b = self._extract_sparse_tensors(data)
+
+        # Stage 1 Conv + ResBlock
+        x_a = self.block1_a(tensor_a)
+        x_b = self.block1_b(tensor_b)
+
+        batch_size = int(max(
+            x_a.C[:, 0].max().item() if x_a.C.numel() > 0 else 0,
+            x_b.C[:, 0].max().item() if x_b.C.numel() > 0 else 0
+        )) + 1
+
+        max_planes = self.spatial_shape[0]
+
+        # Stage 1 Cross Attention
+        summary_a, keys_a = _scatter_plane_summary(x_a.F, x_a.C[:, 0], x_a.C[:, 1], max_planes, num_batch=batch_size)
+        summary_b, keys_b = _scatter_plane_summary(x_b.F, x_b.C[:, 0], x_b.C[:, 1], max_planes, num_batch=batch_size)
+
+        seq_a = summary_a.view(batch_size, max_planes, -1)
+        seq_b = summary_b.view(batch_size, max_planes, -1)
+
+        attn_out_a, _ = self.cross_attn_a(query=seq_a, key=seq_b, value=seq_b)
+        attn_out_b, _ = self.cross_attn_b(query=seq_b, key=seq_a, value=seq_a)
+
+        seq_a = self.norm_a(seq_a + attn_out_a).view(-1, seq_a.size(-1))
+        seq_b = self.norm_b(seq_b + attn_out_b).view(-1, seq_b.size(-1))
+
+        mod_F_a = x_a.F + seq_a[keys_a]
+        mod_F_b = x_b.F + seq_b[keys_b]
+
+        x_a = SparseTensor(feats=mod_F_a, coords=x_a.C)
+        x_b = SparseTensor(feats=mod_F_b, coords=x_b.C)
+
+        # Stage 2 Conv + ResBlock
+        x_a = self.block2_a(x_a)
+        x_b = self.block2_b(x_b)
+
+        # Stage 3 Conv + ResBlock
+        x_a = self.block3_a(x_a)
+        x_b = self.block3_b(x_b)
+
+        pooled_a = self.pool(x_a)
+        pooled_b = self.pool(x_b)
+
+        fused = torch.cat([
+            pooled_a,
+            pooled_b,
+            torch.abs(pooled_a - pooled_b),
+            pooled_a * pooled_b,
+        ], dim=-1)
+
+        return self.classifier(fused)
+
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class DualViewResNetDualPoolCrossAttentionSparseCNN(nn.Module):
+    """
+    Dual-View Sparse ResNet with Intermediate Cross-Attention and Dual Pooling (Average + Max).
+    Combines Global Average Pooling (average shower density) and Global Max Pooling (peak track energy).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        conv_channels: List[int] = [32, 64],
+        fc_dims: List[int] = [32, 16],
+        num_classes: int = 2,
+        dropout: float = 0.1,
+        num_heads: int = 8,
+        spatial_shape: Tuple[int, int] = (486, 192)
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.conv_channels = conv_channels
+        self.spatial_shape = spatial_shape
+
+        c1 = conv_channels[0] if len(conv_channels) > 0 else 32
+        c2 = conv_channels[1] if len(conv_channels) > 1 else c1
+
+        self.block1_a = nn.Sequential(
+            spnn.SubMConv2d(in_channels, c1, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c1),
+            spnn.ReLU(),
+            SparseResBlock(c1, spatial_shape=spatial_shape)
+        )
+        self.block1_b = nn.Sequential(
+            spnn.SubMConv2d(in_channels, c1, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c1),
+            spnn.ReLU(),
+            SparseResBlock(c1, spatial_shape=spatial_shape)
+        )
+
+        self.cross_attn_a = nn.MultiheadAttention(embed_dim=c1, num_heads=num_heads, batch_first=True)
+        self.cross_attn_b = nn.MultiheadAttention(embed_dim=c1, num_heads=num_heads, batch_first=True)
+        self.norm_a = nn.LayerNorm(c1)
+        self.norm_b = nn.LayerNorm(c1)
+
+        self.block2_a = nn.Sequential(
+            spnn.SubMConv2d(c1, c2, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c2),
+            spnn.ReLU(),
+            SparseResBlock(c2, spatial_shape=spatial_shape)
+        )
+        self.block2_b = nn.Sequential(
+            spnn.SubMConv2d(c1, c2, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c2),
+            spnn.ReLU(),
+            SparseResBlock(c2, spatial_shape=spatial_shape)
+        )
+
+        self.avg_pool = spnn.GlobalAvgPooling()
+        fusion_dim = c2 * 8  # avg_a, max_a, avg_b, max_b, abs(avg_diff), avg_prod, abs(max_diff), max_prod
+
+        classifier_layers = []
+        current_dim = fusion_dim
+        for fc_dim in fc_dims:
+            classifier_layers.append(nn.Linear(current_dim, fc_dim))
+            classifier_layers.append(nn.ReLU())
+            if dropout > 0.0:
+                classifier_layers.append(nn.Dropout(dropout))
+            current_dim = fc_dim
+
+        classifier_layers.append(nn.Linear(current_dim, num_classes))
+        self.classifier = nn.Sequential(*classifier_layers)
+
+    def _extract_sparse_tensors(self, data) -> Tuple[SparseTensor, SparseTensor]:
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            return data[0], data[1]
+        elif isinstance(data, dict) and "view_a" in data and "view_b" in data:
+            if isinstance(data["view_a"], SparseTensor):
+                return data["view_a"], data["view_b"]
+
+        if HeteroData is not None and isinstance(data, HeteroData):
+            batch_a = getattr(data["view_a"], "batch", None)
+            if batch_a is None:
+                batch_a = torch.zeros(data["view_a"].x.size(0), dtype=torch.long, device=data["view_a"].x.device)
+            coords_a = torch.cat([batch_a.unsqueeze(1), data["view_a"].pos.long()], dim=1)
+            feats_a = data["view_a"].x[:, :self.in_channels]
+            tensor_a = SparseTensor(feats=feats_a, coords=coords_a)
+
+            batch_b = getattr(data["view_b"], "batch", None)
+            if batch_b is None:
+                batch_b = torch.zeros(data["view_b"].x.size(0), dtype=torch.long, device=data["view_b"].x.device)
+            coords_b = torch.cat([batch_b.unsqueeze(1), data["view_b"].pos.long()], dim=1)
+            feats_b = data["view_b"].x[:, :self.in_channels]
+            tensor_b = SparseTensor(feats=feats_b, coords=coords_b)
+
+            return tensor_a, tensor_b
+
+        raise TypeError("Unsupported data format for DualViewResNetDualPoolCrossAttentionSparseCNN.")
+
+    def forward(self, data) -> torch.Tensor:
+        tensor_a, tensor_b = self._extract_sparse_tensors(data)
+
+        x_a = self.block1_a(tensor_a)
+        x_b = self.block1_b(tensor_b)
+
+        batch_size = int(max(
+            x_a.C[:, 0].max().item() if x_a.C.numel() > 0 else 0,
+            x_b.C[:, 0].max().item() if x_b.C.numel() > 0 else 0
+        )) + 1
+
+        max_planes = self.spatial_shape[0]
+
+        summary_a, keys_a = _scatter_plane_summary(x_a.F, x_a.C[:, 0], x_a.C[:, 1], max_planes, num_batch=batch_size)
+        summary_b, keys_b = _scatter_plane_summary(x_b.F, x_b.C[:, 0], x_b.C[:, 1], max_planes, num_batch=batch_size)
+
+        seq_a = summary_a.view(batch_size, max_planes, -1)
+        seq_b = summary_b.view(batch_size, max_planes, -1)
+
+        attn_out_a, _ = self.cross_attn_a(query=seq_a, key=seq_b, value=seq_b)
+        attn_out_b, _ = self.cross_attn_b(query=seq_b, key=seq_a, value=seq_a)
+
+        seq_a = self.norm_a(seq_a + attn_out_a).view(-1, seq_a.size(-1))
+        seq_b = self.norm_b(seq_b + attn_out_b).view(-1, seq_b.size(-1))
+
+        mod_F_a = x_a.F + seq_a[keys_a]
+        mod_F_b = x_b.F + seq_b[keys_b]
+
+        x_a = SparseTensor(feats=mod_F_a, coords=x_a.C)
+        x_b = SparseTensor(feats=mod_F_b, coords=x_b.C)
+
+        x_a = self.block2_a(x_a)
+        x_b = self.block2_b(x_b)
+
+        avg_a = self.avg_pool(x_a)
+        avg_b = self.avg_pool(x_b)
+        max_a = _sparse_global_max_pooling(x_a)
+        max_b = _sparse_global_max_pooling(x_b)
+
+        fused = torch.cat([
+            avg_a,
+            max_a,
+            avg_b,
+            max_b,
+            torch.abs(avg_a - avg_b),
+            avg_a * avg_b,
+            torch.abs(max_a - max_b),
+            max_a * max_b,
+        ], dim=-1)
+
+        return self.classifier(fused)
+
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class DualViewResNetMultiStageCrossAttentionSparseCNN(nn.Module):
+    """
+    Dual-View Sparse ResNet with Multi-Stage (Stage 1 and Stage 2) Cross-Attention.
+    Exchanges information between U and V views at both fine spatial resolution (Stage 1)
+    and broader region resolution (Stage 2).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        conv_channels: List[int] = [32, 64],
+        fc_dims: List[int] = [16],
+        num_classes: int = 2,
+        dropout: float = 0.1,
+        num_heads: int = 8,
+        spatial_shape: Tuple[int, int] = (486, 192)
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.conv_channels = conv_channels
+        self.spatial_shape = spatial_shape
+
+        c1 = conv_channels[0] if len(conv_channels) > 0 else 32
+        c2 = conv_channels[1] if len(conv_channels) > 1 else c1
+
+        # Stage 1
+        self.block1_a = nn.Sequential(
+            spnn.SubMConv2d(in_channels, c1, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c1),
+            spnn.ReLU(),
+            SparseResBlock(c1, spatial_shape=spatial_shape)
+        )
+        self.block1_b = nn.Sequential(
+            spnn.SubMConv2d(in_channels, c1, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c1),
+            spnn.ReLU(),
+            SparseResBlock(c1, spatial_shape=spatial_shape)
+        )
+
+        # Cross-Attention 1
+        self.cross_attn1_a = nn.MultiheadAttention(embed_dim=c1, num_heads=num_heads, batch_first=True)
+        self.cross_attn1_b = nn.MultiheadAttention(embed_dim=c1, num_heads=num_heads, batch_first=True)
+        self.norm1_a = nn.LayerNorm(c1)
+        self.norm1_b = nn.LayerNorm(c1)
+
+        # Stage 2
+        self.block2_a = nn.Sequential(
+            spnn.SubMConv2d(c1, c2, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c2),
+            spnn.ReLU(),
+            SparseResBlock(c2, spatial_shape=spatial_shape)
+        )
+        self.block2_b = nn.Sequential(
+            spnn.SubMConv2d(c1, c2, kernel_size=3, spatial_shape=spatial_shape),
+            spnn.BatchNorm(c2),
+            spnn.ReLU(),
+            SparseResBlock(c2, spatial_shape=spatial_shape)
+        )
+
+        # Cross-Attention 2
+        self.cross_attn2_a = nn.MultiheadAttention(embed_dim=c2, num_heads=num_heads, batch_first=True)
+        self.cross_attn2_b = nn.MultiheadAttention(embed_dim=c2, num_heads=num_heads, batch_first=True)
+        self.norm2_a = nn.LayerNorm(c2)
+        self.norm2_b = nn.LayerNorm(c2)
+
+        self.pool = spnn.GlobalAvgPooling()
+        pooled_dim = c2
+        fusion_dim = pooled_dim * 4
+
+        classifier_layers = []
+        current_dim = fusion_dim
+        for fc_dim in fc_dims:
+            classifier_layers.append(nn.Linear(current_dim, fc_dim))
+            classifier_layers.append(nn.ReLU())
+            if dropout > 0.0:
+                classifier_layers.append(nn.Dropout(dropout))
+            current_dim = fc_dim
+
+        classifier_layers.append(nn.Linear(current_dim, num_classes))
+        self.classifier = nn.Sequential(*classifier_layers)
+
+    def _extract_sparse_tensors(self, data) -> Tuple[SparseTensor, SparseTensor]:
+        if isinstance(data, (tuple, list)) and len(data) == 2:
+            return data[0], data[1]
+        elif isinstance(data, dict) and "view_a" in data and "view_b" in data:
+            if isinstance(data["view_a"], SparseTensor):
+                return data["view_a"], data["view_b"]
+
+        if HeteroData is not None and isinstance(data, HeteroData):
+            batch_a = getattr(data["view_a"], "batch", None)
+            if batch_a is None:
+                batch_a = torch.zeros(data["view_a"].x.size(0), dtype=torch.long, device=data["view_a"].x.device)
+            coords_a = torch.cat([batch_a.unsqueeze(1), data["view_a"].pos.long()], dim=1)
+            feats_a = data["view_a"].x[:, :self.in_channels]
+            tensor_a = SparseTensor(feats=feats_a, coords=coords_a)
+
+            batch_b = getattr(data["view_b"], "batch", None)
+            if batch_b is None:
+                batch_b = torch.zeros(data["view_b"].x.size(0), dtype=torch.long, device=data["view_b"].x.device)
+            coords_b = torch.cat([batch_b.unsqueeze(1), data["view_b"].pos.long()], dim=1)
+            feats_b = data["view_b"].x[:, :self.in_channels]
+            tensor_b = SparseTensor(feats=feats_b, coords=coords_b)
+
+            return tensor_a, tensor_b
+
+        raise TypeError("Unsupported data format for DualViewResNetMultiStageCrossAttentionSparseCNN.")
+
+    def forward(self, data) -> torch.Tensor:
+        tensor_a, tensor_b = self._extract_sparse_tensors(data)
+
+        # Stage 1
+        x_a = self.block1_a(tensor_a)
+        x_b = self.block1_b(tensor_b)
+
+        batch_size = int(max(
+            x_a.C[:, 0].max().item() if x_a.C.numel() > 0 else 0,
+            x_b.C[:, 0].max().item() if x_b.C.numel() > 0 else 0
+        )) + 1
+
+        max_planes = self.spatial_shape[0]
+
+        # Stage 1 Cross Attention
+        summary1_a, keys1_a = _scatter_plane_summary(x_a.F, x_a.C[:, 0], x_a.C[:, 1], max_planes, num_batch=batch_size)
+        summary1_b, keys1_b = _scatter_plane_summary(x_b.F, x_b.C[:, 0], x_b.C[:, 1], max_planes, num_batch=batch_size)
+
+        seq1_a = summary1_a.view(batch_size, max_planes, -1)
+        seq1_b = summary1_b.view(batch_size, max_planes, -1)
+
+        attn1_a, _ = self.cross_attn1_a(query=seq1_a, key=seq1_b, value=seq1_b)
+        attn1_b, _ = self.cross_attn1_b(query=seq1_b, key=seq1_a, value=seq1_a)
+
+        seq1_a = self.norm1_a(seq1_a + attn1_a).view(-1, seq1_a.size(-1))
+        seq1_b = self.norm1_b(seq1_b + attn1_b).view(-1, seq1_b.size(-1))
+
+        x_a = SparseTensor(feats=x_a.F + seq1_a[keys1_a], coords=x_a.C)
+        x_b = SparseTensor(feats=x_b.F + seq1_b[keys1_b], coords=x_b.C)
+
+        # Stage 2
+        x_a = self.block2_a(x_a)
+        x_b = self.block2_b(x_b)
+
+        # Stage 2 Cross Attention
+        summary2_a, keys2_a = _scatter_plane_summary(x_a.F, x_a.C[:, 0], x_a.C[:, 1], max_planes, num_batch=batch_size)
+        summary2_b, keys2_b = _scatter_plane_summary(x_b.F, x_b.C[:, 0], x_b.C[:, 1], max_planes, num_batch=batch_size)
+
+        seq2_a = summary2_a.view(batch_size, max_planes, -1)
+        seq2_b = summary2_b.view(batch_size, max_planes, -1)
+
+        attn2_a, _ = self.cross_attn2_a(query=seq2_a, key=seq2_b, value=seq2_b)
+        attn2_b, _ = self.cross_attn2_b(query=seq2_b, key=seq2_a, value=seq2_a)
+
+        seq2_a = self.norm2_a(seq2_a + attn2_a).view(-1, seq2_a.size(-1))
+        seq2_b = self.norm2_b(seq2_b + attn2_b).view(-1, seq2_b.size(-1))
+
+        x_a = SparseTensor(feats=x_a.F + seq2_a[keys2_a], coords=x_a.C)
+        x_b = SparseTensor(feats=x_b.F + seq2_b[keys2_b], coords=x_b.C)
+
+        pooled_a = self.pool(x_a)
+        pooled_b = self.pool(x_b)
+
+        fused = torch.cat([
+            pooled_a,
+            pooled_b,
+            torch.abs(pooled_a - pooled_b),
+            pooled_a * pooled_b,
+        ], dim=-1)
+
+        return self.classifier(fused)
+
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+
 
 

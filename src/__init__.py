@@ -33,6 +33,9 @@ from .models import (
     DualViewZipperSparseCNN,
     MinimumViableMINOSGNN,
     NuGraphInspiredBinaryGNN,
+    DualViewDeepResNetCrossAttentionSparseCNN,
+    DualViewResNetDualPoolCrossAttentionSparseCNN,
+    DualViewResNetMultiStageCrossAttentionSparseCNN,
 )
 from .trainer import (
     train_epoch,
@@ -72,6 +75,9 @@ __all__ = [
     'DualViewZipperSparseCNN',
     'MinimumViableMINOSGNN',
     'NuGraphInspiredBinaryGNN',
+    'DualViewDeepResNetCrossAttentionSparseCNN',
+    'DualViewResNetDualPoolCrossAttentionSparseCNN',
+    'DualViewResNetMultiStageCrossAttentionSparseCNN',
     'train_epoch',
     'validate_epoch',
     'compute_metrics',
