@@ -481,10 +481,11 @@ def save_model_checkpoint(
     config: Dict[str, Any],
     best_metrics: Dict[str, float],
     git_hash: str,
-    save_dir: str = "saved_models"
+    save_dir: str = "saved_models",
+    history: Optional[Dict[str, list]] = None,
 ) -> str:
     """
-    Saves the trained PyTorch model state_dict along with configuration metadata and metrics.
+    Saves the trained PyTorch model state_dict along with configuration metadata, history, and metrics.
     Returns the path to the saved checkpoint file.
     """
     os.makedirs(save_dir, exist_ok=True)
@@ -498,6 +499,7 @@ def save_model_checkpoint(
         "model_state_dict": model.state_dict(),
         "config": config,
         "best_metrics": best_metrics,
+        "history": history,
         "git_hash": git_hash,
         "timestamp": datetime.now().isoformat(),
     }
@@ -512,6 +514,7 @@ def log_experiment(
     best_metrics: Dict[str, float],
     git_hash: str,
     model_path: str,
+    num_params: Optional[int] = None,
     csv_path: str = "model_leaderboard.csv"
 ) -> pd.DataFrame:
     """
@@ -522,6 +525,7 @@ def log_experiment(
         "git_hash",
         "model_type",
         "model_name",
+        "num_params",
         "roc_auc",
         "f1",
         "accuracy",
@@ -530,6 +534,9 @@ def log_experiment(
         "num_epochs",
         "batch_size",
         "lr",
+        "step_size",
+        "gamma",
+        "weight_decay",
         "feature_mode",
         "max_events",
         "model_path",
@@ -540,6 +547,7 @@ def log_experiment(
         "git_hash": git_hash,
         "model_type": config.get("model_type", "unknown"),
         "model_name": model_name,
+        "num_params": num_params if num_params is not None else config.get("num_params", 0),
         "roc_auc": round(float(best_metrics.get("roc_auc", 0.0)), 4),
         "f1": round(float(best_metrics.get("f1", 0.0)), 4),
         "accuracy": round(float(best_metrics.get("accuracy", 0.0)), 4),
@@ -548,7 +556,10 @@ def log_experiment(
         "num_epochs": config.get("num_epochs", 0),
         "batch_size": config.get("batch_size", 0),
         "lr": config.get("lr", 0.0),
-        "feature_mode": config.get("feature_mode", "dual_ph"),
+        "step_size": config.get("step_size", 0),
+        "gamma": config.get("gamma", 0.0),
+        "weight_decay": config.get("weight_decay", 0.0),
+        "feature_mode": config.get("feature_mode", "sum"),
         "max_events": config.get("max_events", "all"),
         "model_path": model_path,
     }

@@ -37,6 +37,11 @@ from .models import (
     DualViewResNetDualPoolCrossAttentionSparseCNN,
     DualViewResNetMultiStageCrossAttentionSparseCNN,
 )
+from .model_configs import (
+    MODEL_CONFIGS,
+    DATASET_CONFIG,
+    get_config,
+)
 from .trainer import (
     train_epoch,
     validate_epoch,
@@ -78,6 +83,9 @@ __all__ = [
     'DualViewDeepResNetCrossAttentionSparseCNN',
     'DualViewResNetDualPoolCrossAttentionSparseCNN',
     'DualViewResNetMultiStageCrossAttentionSparseCNN',
+    'MODEL_CONFIGS',
+    'DATASET_CONFIG',
+    'get_config',
     'train_epoch',
     'validate_epoch',
     'compute_metrics',

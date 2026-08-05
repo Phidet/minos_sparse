@@ -1,17 +1,1 @@
-timestamp,git_hash,model_type,model_name,roc_auc,f1,accuracy,val_loss,threshold,num_epochs,batch_size,lr,feature_mode,max_events,model_path
-2026-08-04 14:46:39,1bf73d4,cnn_dualview,DualViewSparseCNN,0.9287,0.9113,0.8614,0.3283,0.241,12,32,0.001,dual_ph,12000,saved_models/cnn_dualview_20260804_144639_1bf73d4.pt
-2026-08-04 14:53:52,a982474,cnn_dualview,DualViewSparseCNN,0.9307,0.912,0.8614,0.3293,0.227,12,32,0.001,sum,12000,saved_models/cnn_dualview_20260804_145352_a982474.pt
-2026-08-04 15:00:47,d55b4c3,cnn_simplified_dualview,SimplifiedDualViewSparseCNN,0.9273,0.9106,0.8563,0.3276,0.202,12,32,0.001,sum,12000,saved_models/cnn_simplified_dualview_20260804_150047_d55b4c3.pt
-2026-08-04 15:07:27,3a919d2,cnn_cross_attention,DualViewCrossAttentionSparseCNN,0.9292,0.9075,0.8533,0.3059,0.207,12,32,0.001,sum,12000,saved_models/cnn_cross_attention_20260804_150727_3a919d2.pt
-2026-08-04 15:14:46,46ca002,cnn_cross_attention,DualViewCrossAttentionSparseCNN,0.9329,0.9114,0.8648,0.2686,0.512,12,32,0.001,sum,12000,saved_models/cnn_cross_attention_20260804_151446_46ca002.pt
-2026-08-04 15:19:24,31425ed,cnn_dualview,DualViewSparseCNN,0.931,0.9127,0.8623,0.2811,0.443,12,32,0.001,sum,12000,saved_models/cnn_dualview_20260804_151924_31425ed.pt
-2026-08-04 15:34:45,e8df380,cnn_positional_cross_attention,DualViewPositionalCrossAttentionSparseCNN,0.9293,0.9121,0.8653,0.2739,0.507,12,32,0.001,sum,12000,saved_models/cnn_positional_cross_attention_20260804_153445_e8df380.pt
-2026-08-04 15:42:16,eae11e0,cnn_multistage_cross_attention,DualViewMultiStageCrossAttentionSparseCNN,0.9281,0.9097,0.8576,0.2723,0.448,12,32,0.001,sum,12000,saved_models/cnn_multistage_cross_attention_20260804_154216_eae11e0.pt
-2026-08-04 15:51:32,a245a70,cnn_simplified_cross_attention,SimplifiedDualViewCrossAttentionSparseCNN,0.93,0.911,0.8597,0.2737,0.434,12,32,0.001,sum,12000,saved_models/cnn_simplified_cross_attention_20260804_155132_a245a70.pt
-2026-08-04 15:55:55,9a08197,cnn,SimpleUViewSparseCNN,0.8628,0.8968,0.8328,0.38,0.453,12,32,0.001,sum,12000,saved_models/cnn_20260804_155555_9a08197.pt
-2026-08-04 16:08:18,c49a342,cnn_cross_attention,DualViewCrossAttentionSparseCNN,0.9372,0.9173,0.8708,0.2608,0.453,12,32,0.001,sum,12000,saved_models/cnn_cross_attention_20260804_160818_c49a342.pt
-2026-08-04 16:21:28,fdda040,cnn_deep_cross_attention,DualViewDeepCrossAttentionSparseCNN,0.9362,0.9177,0.8721,0.2611,0.468,12,32,0.001,sum,12000,saved_models/cnn_deep_cross_attention_20260804_162128_fdda040.pt
-2026-08-04 16:32:04,a525ba5,cnn_transformer_cross_attention,DualViewTransformerCrossAttnSparseCNN,0.934,0.9172,0.8708,0.2721,0.419,12,32,0.001,sum,12000,saved_models/cnn_transformer_cross_attention_20260804_163204_a525ba5.pt
-2026-08-04 16:40:20,efd75c4,cnn_cross_attention,DualViewCrossAttentionSparseCNN,0.9356,0.917,0.873,0.2642,0.493,12,32,0.001,dual_ph,12000,saved_models/cnn_cross_attention_20260804_164020_efd75c4.pt
-2026-08-04 16:53:30,899d43b,cnn_positional_cross_attention,DualViewPositionalCrossAttentionSparseCNN,0.9325,0.912,0.864,0.275,0.552,15,32,0.001,sum,12000,saved_models/cnn_positional_cross_attention_20260804_165330_899d43b.pt
-2026-08-04 17:04:49,2d23fb3,cnn_resnet_cross_attention,DualViewResNetCrossAttentionSparseCNN,0.9378,0.9166,0.8725,0.2578,0.488,12,32,0.001,sum,12000,saved_models/cnn_resnet_cross_attention_20260804_170449_2d23fb3.pt
+timestamp,git_hash,model_type,model_name,num_params,roc_auc,f1,accuracy,val_loss,threshold,num_epochs,batch_size,lr,step_size,gamma,weight_decay,feature_mode,max_events,model_path
