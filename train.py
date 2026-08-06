@@ -211,8 +211,10 @@ def main():
         )
 
         # Log metrics & hyperparameters to CSV leaderboard
+        run_config = dict(config)
+        run_config["max_events"] = len(dataset)
         leaderboard_df = log_experiment(
-            config=config,
+            config=run_config,
             model_name=model_name,
             best_metrics=best_metrics,
             git_hash=git_hash,

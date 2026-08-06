@@ -63,11 +63,21 @@ class MINOSSingleViewDataset(Dataset):
                 raise ValueError(f"Cache {cache_file} does not contain single-view events")
 
             cached_feature_mode = cache.get("feature_mode", "sum")
+            cached_max_events = cache.get("max_events", None)
+            cached_events = cache["events"]
+
             if cached_feature_mode == self.feature_mode:
-                self.root_filepath = Path(cache.get("root_filepath", self.root_filepath))
-                self.target_view = int(cache.get("target_view", self.target_view))
-                self.events = cache["events"]
-                return
+                if max_events is not None and len(cached_events) < max_events and cached_max_events is not None and cached_max_events < max_events:
+                    if not allow_root_fallback:
+                        raise ValueError(
+                            f"Cache {cache_file} contains {len(cached_events)} events (capped at {cached_max_events}), "
+                            f"but requested max_events={max_events} and allow_root_fallback=False."
+                        )
+                else:
+                    self.root_filepath = Path(cache.get("root_filepath", self.root_filepath))
+                    self.target_view = int(cache.get("target_view", self.target_view))
+                    self.events = cached_events[:max_events] if max_events is not None else cached_events
+                    return
             elif not allow_root_fallback:
                 raise ValueError(
                     f"Cache {cache_file} has feature_mode='{cached_feature_mode}', "
@@ -302,17 +312,26 @@ class MINOSMultiViewGraphDataset(Dataset):
 
             cached_view_ids = tuple(cache.get("view_ids", ()))
             cached_feature_mode = cache.get("feature_mode", "sum")
+            cached_max_events = cache.get("max_events", None)
+            cached_events = cache["events"]
             valid_view_ids = (view_ids is None or tuple(int(v) for v in view_ids) == cached_view_ids)
             valid_mode = (cached_feature_mode == self.feature_mode)
 
             if valid_view_ids and valid_mode:
-                self.root_filepath = Path(cache.get("root_filepath", self.root_filepath))
-                self.view_ids = cached_view_ids
-                self.plane_radius = int(cache.get("plane_radius", self.plane_radius))
-                self.strip_radius = int(cache.get("strip_radius", self.strip_radius))
-                self.graph_mode = str(cache.get("graph_mode", self.graph_mode))
-                self.events = cache["events"]
-                return
+                if max_events is not None and len(cached_events) < max_events and cached_max_events is not None and cached_max_events < max_events:
+                    if not allow_root_fallback:
+                        raise ValueError(
+                            f"Cache {cache_file} contains {len(cached_events)} events (capped at {cached_max_events}), "
+                            f"but requested max_events={max_events} and allow_root_fallback=False."
+                        )
+                else:
+                    self.root_filepath = Path(cache.get("root_filepath", self.root_filepath))
+                    self.view_ids = cached_view_ids
+                    self.plane_radius = int(cache.get("plane_radius", self.plane_radius))
+                    self.strip_radius = int(cache.get("strip_radius", self.strip_radius))
+                    self.graph_mode = str(cache.get("graph_mode", self.graph_mode))
+                    self.events = cached_events[:max_events] if max_events is not None else cached_events
+                    return
             elif not allow_root_fallback:
                 raise ValueError(
                     f"Cache {cache_file} invalid for view_ids={view_ids}, feature_mode={self.feature_mode} "
