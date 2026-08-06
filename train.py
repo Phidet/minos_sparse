@@ -106,23 +106,36 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"PyTorch Device: {device}\n")
 
-    # Prepare shared dataset
+    # Determine which feature_modes are needed across all target models
     max_events = args.max_events if args.max_events is not None else DATASET_CONFIG["max_events"]
-    print(f"Loading MINOS dataset (max_events={max_events}, feature_mode='{DATASET_CONFIG['feature_mode']}')...")
-    dataset = MINOSMultiViewGraphDataset(
-        root_filepath=DATASET_CONFIG["root_filepath"],
-        max_events=max_events,
-        view_ids=DATASET_CONFIG["view_ids"],
-        plane_radius=DATASET_CONFIG["plane_radius"],
-        strip_radius=DATASET_CONFIG["strip_radius"],
-        feature_mode=DATASET_CONFIG["feature_mode"],
-        cache_path=DATASET_CONFIG["cache_path"],
-        allow_root_fallback=DATASET_CONFIG.get("allow_root_fallback", True),
-    )
+    needed_modes = set()
+    for key in target_keys:
+        config = get_config(key)
+        needed_modes.add(config.get("feature_mode", DATASET_CONFIG["feature_mode"]))
 
-    sample_graph = dataset[0]
-    metadata = sample_graph.metadata()
-    graph_in_channels = sample_graph["view_a"].x.size(-1)
+    # Lazily load datasets keyed by feature_mode
+    datasets = {}
+    for mode in needed_modes:
+        cache_path = DATASET_CONFIG["cache_path"]
+        # Use per-model cache_path if specified in any config with this mode
+        for key in target_keys:
+            cfg = get_config(key)
+            if cfg.get("feature_mode", DATASET_CONFIG["feature_mode"]) == mode:
+                cache_path = cfg.get("cache_path", DATASET_CONFIG["cache_path"])
+                break
+
+        print(f"Loading MINOS dataset (max_events={max_events}, feature_mode='{mode}')...")
+        datasets[mode] = MINOSMultiViewGraphDataset(
+            root_filepath=DATASET_CONFIG["root_filepath"],
+            max_events=max_events,
+            view_ids=DATASET_CONFIG["view_ids"],
+            plane_radius=DATASET_CONFIG["plane_radius"],
+            strip_radius=DATASET_CONFIG["strip_radius"],
+            feature_mode=mode,
+            cache_path=cache_path,
+            allow_root_fallback=DATASET_CONFIG.get("allow_root_fallback", True),
+        )
+        print(f"  Loaded {len(datasets[mode])} events for feature_mode='{mode}'")
 
     # Train each model configuration
     completed_runs = []
@@ -132,10 +145,13 @@ def main():
         num_epochs = args.num_epochs if args.num_epochs is not None else config.get("num_epochs", 12)
         lr = args.lr if args.lr is not None else config.get("lr", 1e-3)
         batch_size = config.get("batch_size", 32)
+        model_feature_mode = config.get("feature_mode", DATASET_CONFIG["feature_mode"])
+        dataset = datasets[model_feature_mode]
 
         print(f"\n[{idx}/{len(target_keys)}] Starting Training: {key} ({model_name})")
         print(f"    Epochs: {num_epochs} | LR: {lr:.1e} | Batch Size: {batch_size} | Weight Decay: {config.get('weight_decay', 1e-4)}")
         print(f"    LR Scheduler: StepLR(step_size={config.get('step_size', 3)}, gamma={config.get('gamma', 0.3)})")
+        print(f"    Feature Mode: {model_feature_mode}")
 
         train_loader, val_loader, _, _ = create_multiview_gnn_dataloaders(
             dataset,
@@ -150,7 +166,16 @@ def main():
             class_weights = None
 
         # Build PyTorch model instance
+        sample_graph = dataset[0]
         if config.get("is_gnn", False):
+            # Timing GNN uses homogeneous Data (no metadata/nexus);
+            # other GNNs use HeteroData with metadata()
+            if hasattr(sample_graph, "metadata"):
+                metadata = sample_graph.metadata()
+                graph_in_channels = sample_graph["view_a"].x.size(-1)
+            else:
+                metadata = None
+                graph_in_channels = sample_graph.x.size(-1)
             model = config["model_factory"](metadata, graph_in_channels)
         else:
             model = config["model"]

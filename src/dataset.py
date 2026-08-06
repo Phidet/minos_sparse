@@ -6,10 +6,11 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 try:
-    from torch_geometric.data import HeteroData
+    from torch_geometric.data import HeteroData, Data
     from torch_geometric.loader import DataLoader as PyGDataLoader
 except ImportError:
     HeteroData = None
+    Data = None
     PyGDataLoader = None
 
 
@@ -267,6 +268,9 @@ class MINOSMultiViewGraphDataset(Dataset):
       - 'sum': 1 hit feature [log1p(ph0 + ph1)]
       - 'dual_ph': 2 hit features [log1p(ph0), log1p(ph1)]
       - 'ph_full': 4 hit features [log1p(ph0 + ph1), log1p(ph0), log1p(ph1), asymmetry_ratio]
+      - 'timing': 9 hit features with timing/spatial info, merged homogeneous graph
+                  [PE_east_log, PE_west_log, t_scaled, dt_scaled, tpos_norm, z_norm,
+                   view_flag, readout_valid_east, readout_valid_west]
     """
 
     def __init__(
@@ -343,6 +347,13 @@ class MINOSMultiViewGraphDataset(Dataset):
             "NtpStRecord/mc/mc.iaction",
             "NtpStRecord/mc/mc.p4neu[4]",
         ]
+        if self.feature_mode == "timing":
+            req_branches.extend([
+                "NtpStRecord/stp/stp.time0",
+                "NtpStRecord/stp/stp.time1",
+                "NtpStRecord/stp/stp.tpos",
+                "NtpStRecord/stp/stp.z",
+            ])
 
         branches = tree.arrays(req_branches, entry_stop=max_events)
 
@@ -375,7 +386,17 @@ class MINOSMultiViewGraphDataset(Dataset):
             ph0 = np.array(branches["NtpStRecord/stp/stp.ph0.pe"][i])
             ph1 = np.array(branches["NtpStRecord/stp/stp.ph1.pe"][i])
 
-            event = self._build_event_graph(views, planes, strips, ph0, ph1, label, true_energy)
+            if self.feature_mode == "timing":
+                time0 = np.array(branches["NtpStRecord/stp/stp.time0"][i])
+                time1 = np.array(branches["NtpStRecord/stp/stp.time1"][i])
+                tpos = np.array(branches["NtpStRecord/stp/stp.tpos"][i])
+                z = np.array(branches["NtpStRecord/stp/stp.z"][i])
+                event = self._build_timing_graph(
+                    views, planes, strips, ph0, ph1,
+                    time0, time1, tpos, z, label, true_energy,
+                )
+            else:
+                event = self._build_event_graph(views, planes, strips, ph0, ph1, label, true_energy)
             if event is not None:
                 self.events.append(event)
 
@@ -403,7 +424,9 @@ class MINOSMultiViewGraphDataset(Dataset):
 
     @property
     def in_channels(self) -> int:
-        if self.feature_mode == "dual_ph":
+        if self.feature_mode == "timing":
+            return 9
+        elif self.feature_mode == "dual_ph":
             return 2
         elif self.feature_mode == "ph_full":
             return 4
@@ -569,6 +592,243 @@ class MINOSMultiViewGraphDataset(Dataset):
         data.y = torch.tensor(label, dtype=torch.long)
         data.true_energy = torch.tensor(true_energy, dtype=torch.float32)
         return data
+
+    # ── Timing-aware merged graph construction ────────────────────────
+
+    def _build_timing_graph(
+        self,
+        views: np.ndarray,
+        planes: np.ndarray,
+        strips: np.ndarray,
+        ph0: np.ndarray,
+        ph1: np.ndarray,
+        time0: np.ndarray,
+        time1: np.ndarray,
+        tpos: np.ndarray,
+        z: np.ndarray,
+        label: int,
+        true_energy: float,
+    ):
+        """Build a merged homogeneous graph with timing features for both views."""
+        if Data is None:
+            raise ImportError(
+                "torch_geometric is required for timing graph construction."
+            )
+
+        view_a_id, view_b_id = self.view_ids
+        mask_a = views == view_a_id
+        mask_b = views == view_b_id
+        combined_mask = mask_a | mask_b
+
+        if np.sum(mask_a) == 0 or np.sum(mask_b) == 0:
+            return None
+
+        # Select hits from both views
+        sel_ph0 = ph0[combined_mask]
+        sel_ph1 = ph1[combined_mask]
+        sel_time0 = time0[combined_mask]
+        sel_time1 = time1[combined_mask]
+        sel_tpos = tpos[combined_mask]
+        sel_z = z[combined_mask]
+        sel_planes = planes[combined_mask]
+        sel_views = views[combined_mask]
+        n_hits = int(np.sum(combined_mask))
+
+        if n_hits < 2:
+            return None
+
+        # --- Readout validity masks ---
+        # Sentinel value for missing readout is -999999 in time, and 0 in ph
+        valid_east = (sel_ph0 > 0).astype(np.float32)
+        valid_west = (sel_ph1 > 0).astype(np.float32)
+
+        # --- Charge features (log-scaled) ---
+        pe_east_log = np.log1p(np.maximum(0.0, sel_ph0)).astype(np.float32)
+        pe_west_log = np.log1p(np.maximum(0.0, sel_ph1)).astype(np.float32)
+
+        # --- Time features ---
+        # Convert times from seconds to nanoseconds
+        t0_ns = sel_time0 * 1e9
+        t1_ns = sel_time1 * 1e9
+
+        # Compute per-hit mean time and dt where both sides are valid
+        both_valid = (valid_east > 0) & (valid_west > 0)
+        t_mean_raw = np.zeros(n_hits, dtype=np.float64)
+        dt_raw = np.zeros(n_hits, dtype=np.float64)
+
+        # For both-valid hits: use mean and difference
+        if np.any(both_valid):
+            t_mean_raw[both_valid] = (t0_ns[both_valid] + t1_ns[both_valid]) / 2.0
+            dt_raw[both_valid] = t0_ns[both_valid] - t1_ns[both_valid]
+
+        # For single-ended hits: use the valid side's time as the mean
+        east_only = (valid_east > 0) & (valid_west == 0)
+        west_only = (valid_west > 0) & (valid_east == 0)
+        if np.any(east_only):
+            t_mean_raw[east_only] = t0_ns[east_only]
+        if np.any(west_only):
+            t_mean_raw[west_only] = t1_ns[west_only]
+
+        # Event-relative zeroing using median of valid hit times
+        any_valid = (valid_east > 0) | (valid_west > 0)
+        if np.any(any_valid):
+            t0_event = float(np.median(t_mean_raw[any_valid]))
+        else:
+            t0_event = 0.0
+        t_rel = t_mean_raw - t0_event
+
+        # Clip and scale
+        T_MAX_NS = 150.0
+        DT_MAX_NS = 300.0
+        t_scaled = np.clip(t_rel, -T_MAX_NS, T_MAX_NS) / T_MAX_NS
+        dt_scaled = np.clip(dt_raw, -DT_MAX_NS, DT_MAX_NS) / DT_MAX_NS
+
+        # Zero out timing features for hits with no valid readout
+        no_valid = ~any_valid
+        t_scaled[no_valid] = 0.0
+        dt_scaled[no_valid] = 0.0
+        # For single-ended hits, dt is not meaningful — zero it out
+        dt_scaled[~both_valid] = 0.0
+
+        # --- Spatial features ---
+        tpos_norm = (sel_tpos / 4.0).astype(np.float32)
+        z_norm = ((sel_z - 15.0) / 15.0).astype(np.float32)
+
+        # --- View flag ---
+        view_flag = np.where(sel_views == view_a_id, 0.0, 1.0).astype(np.float32)
+
+        # --- Assemble 9-feature node vector ---
+        node_feats = np.column_stack([
+            pe_east_log,
+            pe_west_log,
+            t_scaled.astype(np.float32),
+            dt_scaled.astype(np.float32),
+            tpos_norm,
+            z_norm,
+            view_flag,
+            valid_east,
+            valid_west,
+        ]).astype(np.float32)
+
+        x = torch.tensor(node_feats, dtype=torch.float32)
+
+        # --- Edge construction: spacetime kNN ---
+        edge_index, edge_attr = self._build_timing_edges(
+            sel_z, sel_tpos, t_rel.astype(np.float32),
+            sel_views, sel_planes, view_a_id, view_b_id, k=8,
+        )
+
+        # --- Build homogeneous Data object ---
+        data = Data(
+            x=x,
+            edge_index=edge_index,
+            edge_attr=edge_attr,
+            y=torch.tensor(label, dtype=torch.long),
+        )
+        data.true_energy = torch.tensor(true_energy, dtype=torch.float32)
+        return data
+
+    def _build_timing_edges(
+        self,
+        z: np.ndarray,
+        tpos: np.ndarray,
+        t_rel: np.ndarray,
+        views: np.ndarray,
+        planes: np.ndarray,
+        view_a_id: int,
+        view_b_id: int,
+        k: int = 8,
+    ) -> tuple:
+        """Build spacetime kNN edges with 6-dimensional edge features."""
+        n = len(z)
+        if n < 2:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_attr = torch.empty((0, 6), dtype=torch.float32)
+            return edge_index, edge_attr
+
+        # Speed of light in fiber ~ 0.2 m/ns (c_fiber for MINOS WLS fiber)
+        C_SCALE = 0.2  # meters per nanosecond
+
+        # Compute pairwise spacetime distance
+        dz = z[:, None] - z[None, :]       # [N, N]
+        dtpos = tpos[:, None] - tpos[None, :]  # [N, N]
+        dt = t_rel[:, None] - t_rel[None, :]   # [N, N] in nanoseconds
+
+        spatial_dist_sq = dz ** 2 + dtpos ** 2
+        spacetime_dist = np.sqrt(spatial_dist_sq + (C_SCALE * dt) ** 2)
+
+        # Same-view flag
+        same_view = (views[:, None] == views[None, :]).astype(np.float32)
+
+        # kNN: for each node, select k nearest neighbors (excluding self)
+        np.fill_diagonal(spacetime_dist, np.inf)
+        effective_k = min(k, n - 1)
+        knn_indices = np.argpartition(spacetime_dist, effective_k, axis=1)[:, :effective_k]
+
+        # Also add cross-view edges at same/adjacent planes
+        plane_diff = np.abs(planes[:, None].astype(int) - planes[None, :].astype(int))
+        cross_view = (same_view == 0) & (plane_diff <= self.plane_radius)
+
+        # Build edge lists
+        src_list = []
+        dst_list = []
+        edge_set = set()
+
+        # Add kNN edges
+        for i in range(n):
+            for j in knn_indices[i]:
+                j = int(j)
+                if (i, j) not in edge_set:
+                    edge_set.add((i, j))
+                    edge_set.add((j, i))
+                    src_list.extend([i, j])
+                    dst_list.extend([j, i])
+
+        # Add cross-view edges (may already be in kNN set)
+        cross_src, cross_dst = np.where(cross_view)
+        for i, j in zip(cross_src, cross_dst):
+            i, j = int(i), int(j)
+            if (i, j) not in edge_set:
+                edge_set.add((i, j))
+                src_list.append(i)
+                dst_list.append(j)
+
+        if not src_list:
+            edge_index = torch.empty((2, 0), dtype=torch.long)
+            edge_attr = torch.empty((0, 6), dtype=torch.float32)
+            return edge_index, edge_attr
+
+        src = np.array(src_list, dtype=np.int64)
+        dst = np.array(dst_list, dtype=np.int64)
+
+        edge_index = torch.tensor(np.stack([src, dst], axis=0), dtype=torch.long)
+
+        # --- Edge features [Δz, Δtpos, Δt_scaled, ||r||, causal_flag, same_view_flag] ---
+        e_dz = (z[dst] - z[src]).astype(np.float32)
+        e_dtpos = (tpos[dst] - tpos[src]).astype(np.float32)
+        e_dt = (t_rel[dst] - t_rel[src]).astype(np.float32)
+        e_dt_scaled = np.clip(e_dt, -300.0, 300.0) / 300.0
+        e_dist = np.sqrt(e_dz ** 2 + e_dtpos ** 2).astype(np.float32)
+
+        # Causality flag: |Δt| >= ||Δr|| / c  (is it physically reachable at <= c?)
+        # c in vacuum ~ 0.3 m/ns
+        C_VACUUM = 0.3  # meters per nanosecond
+        abs_dt_ns = np.abs(e_dt)
+        causal_flag = (abs_dt_ns >= e_dist / C_VACUUM).astype(np.float32)
+
+        same_view_flag = (views[src] == views[dst]).astype(np.float32)
+
+        edge_features = np.column_stack([
+            e_dz / 15.0,        # Normalize Δz ~ same scale as z_norm
+            e_dtpos / 4.0,      # Normalize Δtpos ~ same scale as tpos_norm
+            e_dt_scaled,
+            e_dist / 15.0,      # Normalize distance
+            causal_flag,
+            same_view_flag,
+        ]).astype(np.float32)
+
+        edge_attr = torch.tensor(edge_features, dtype=torch.float32)
+        return edge_index, edge_attr
 
 
     def __len__(self) -> int:

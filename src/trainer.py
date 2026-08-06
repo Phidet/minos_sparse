@@ -494,10 +494,19 @@ def save_model_checkpoint(
     filename = f"{model_type}_{timestamp}_{git_hash}.pt"
     filepath = os.path.join(save_dir, filename)
 
+    # Filter out non-picklable config entries (e.g. lambda model_factory, model instances)
+    safe_config = {}
+    for k, v in config.items():
+        if callable(v) and not isinstance(v, type):
+            continue  # skip lambdas and functions
+        if hasattr(v, 'parameters'):
+            continue  # skip nn.Module instances
+        safe_config[k] = v
+
     checkpoint = {
         "model_type": model_type,
         "model_state_dict": model.state_dict(),
-        "config": config,
+        "config": safe_config,
         "best_metrics": best_metrics,
         "history": history,
         "git_hash": git_hash,

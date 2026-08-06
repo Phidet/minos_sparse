@@ -36,6 +36,7 @@ from .models import (
     DualViewDeepResNetCrossAttentionSparseCNN,
     DualViewResNetDualPoolCrossAttentionSparseCNN,
     DualViewResNetMultiStageCrossAttentionSparseCNN,
+    TimingAwareGNN,
 )
 from .model_configs import (
     MODEL_CONFIGS,
@@ -83,6 +84,7 @@ __all__ = [
     'DualViewDeepResNetCrossAttentionSparseCNN',
     'DualViewResNetDualPoolCrossAttentionSparseCNN',
     'DualViewResNetMultiStageCrossAttentionSparseCNN',
+    'TimingAwareGNN',
     'MODEL_CONFIGS',
     'DATASET_CONFIG',
     'get_config',

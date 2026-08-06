@@ -33,6 +33,7 @@ from .models import (
     DualViewDeepResNetCrossAttentionSparseCNN,
     DualViewResNetDualPoolCrossAttentionSparseCNN,
     DualViewResNetMultiStageCrossAttentionSparseCNN,
+    TimingAwareGNN,
 )
 
 
@@ -523,6 +524,30 @@ MODEL_CONFIGS = {
         "use_class_weights": False,
         "use_energy_weights": False,
         "feature_mode": "sum",
+        "max_events": 12000,
+    },
+
+    "gnn_timing": {
+        "model_factory": lambda metadata, in_channels: TimingAwareGNN(
+            in_channels=in_channels,
+            edge_dim=6,
+            hidden_channels=48,
+            num_layers=3,
+            dropout=0.15,
+        ),
+        "is_gnn": True,
+        "model_type": "gnn_timing",
+        "model_name": "TimingAwareGNN",
+        "num_epochs": 20,
+        "lr": 1e-3,
+        "weight_decay": 1e-4,
+        "batch_size": 32,
+        "step_size": 5,
+        "gamma": 0.5,
+        "use_class_weights": False,
+        "use_energy_weights": False,
+        "feature_mode": "timing",
+        "cache_path": "data/cache/minos_uview_multi_view_graph_timing.pt",
         "max_events": 12000,
     },
 }

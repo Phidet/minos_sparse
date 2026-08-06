@@ -6,12 +6,15 @@ from src.torchsparse import SparseTensor
 import src.torchsparse.nn as spnn
 
 try:
-    from torch_geometric.nn import HeteroConv, SAGEConv, global_mean_pool
+    from torch_geometric.nn import HeteroConv, SAGEConv, global_mean_pool, global_max_pool, EdgeConv, GraphNorm
     from torch_geometric.data import HeteroData
 except ImportError:
     HeteroConv = None
     SAGEConv = None
     global_mean_pool = None
+    global_max_pool = None
+    EdgeConv = None
+    GraphNorm = None
     HeteroData = None
 
 
@@ -3466,6 +3469,150 @@ class DualViewResNetMultiStageCrossAttentionSparseCNN(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class TimingAwareGNN(nn.Module):
+    """
+    Timing-aware GNN for MINOS CC/NC classification.
 
+    Exploits dual-ended strip readout timing (East/West) alongside charge and
+    spatial features. Operates on a merged homogeneous graph containing hits
+    from both U and V views, with cross-view edges and spacetime-kNN edges.
 
+    Node features (9-dim):
+        PE_east_log, PE_west_log, t_scaled, dt_scaled, tpos_norm, z_norm,
+        view_flag, readout_valid_east, readout_valid_west
+
+    Edge features (6-dim):
+        Δz, Δtpos, Δt_scaled, ||r||, causal_flag, same_view_flag
+
+    Architecture:
+        - Node encoder MLP: in_channels → hidden_channels
+        - Edge encoder MLP: edge_dim → hidden_channels
+        - N stacked EdgeConv-style message passing layers with:
+          * Edge-feature-aware aggregation
+          * Residual gated updates
+          * GraphNorm normalization
+        - Concat(global_mean_pool, global_max_pool) readout
+        - Classification MLP head with dropout
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 9,
+        edge_dim: int = 6,
+        hidden_channels: int = 48,
+        num_layers: int = 3,
+        num_classes: int = 2,
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+
+        if EdgeConv is None or global_mean_pool is None or global_max_pool is None or GraphNorm is None:
+            raise ImportError(
+                "torch_geometric is required for TimingAwareGNN. "
+                "Install PyTorch Geometric to use this model."
+            )
+
+        self.hidden_channels = hidden_channels
+        self.num_layers = num_layers
+        self.dropout = dropout
+
+        # Node encoder: raw features → hidden_channels
+        self.node_encoder = nn.Sequential(
+            nn.Linear(in_channels, hidden_channels),
+            nn.SiLU(),
+            nn.Linear(hidden_channels, hidden_channels),
+        )
+
+        # Edge encoder: raw edge features → hidden_channels
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(edge_dim, hidden_channels),
+            nn.SiLU(),
+            nn.Linear(hidden_channels, hidden_channels),
+        )
+
+        # Message passing layers
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        self.gates = nn.ModuleList()
+        self.edge_mlps = nn.ModuleList()
+
+        for _ in range(num_layers):
+            # EdgeConv-style MLP: takes concatenated [x_i, x_j, e_ij] → hidden
+            edge_mlp = nn.Sequential(
+                nn.Linear(2 * hidden_channels + hidden_channels, hidden_channels),
+                nn.SiLU(),
+                nn.Linear(hidden_channels, hidden_channels),
+            )
+            self.edge_mlps.append(edge_mlp)
+
+            self.convs.append(
+                EdgeConv(nn=edge_mlp, aggr="max")
+            )
+            self.norms.append(GraphNorm(hidden_channels))
+            self.gates.append(nn.Sequential(
+                nn.Linear(2 * hidden_channels, hidden_channels),
+                nn.Sigmoid(),
+            ))
+
+        # Readout: concat(mean_pool, max_pool) → 2 * hidden_channels
+        pooled_dim = hidden_channels * 2
+        self.readout = nn.Sequential(
+            nn.Linear(pooled_dim, hidden_channels),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, hidden_channels // 2),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels // 2, num_classes),
+        )
+
+    def forward(self, data) -> torch.Tensor:
+        x = data.x
+        edge_index = data.edge_index
+        edge_attr = data.edge_attr
+        batch = getattr(data, "batch", None)
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        # Encode nodes and edges
+        h = self.node_encoder(x)
+        e = self.edge_encoder(edge_attr) if edge_attr is not None else None
+
+        # Message passing with residual gated updates
+        for i, (conv, norm, gate) in enumerate(zip(self.convs, self.norms, self.gates)):
+            # Build edge-feature-enriched node pairs for EdgeConv
+            # EdgeConv expects nn(cat(x_i, x_j - x_i)) by default,
+            # but we override by augmenting node features with edge features
+            # via a custom approach: we pre-concatenate edge features to target nodes
+            src, dst = edge_index[0], edge_index[1]
+
+            # Construct input for conv: cat(h[src], h[dst], edge_feat)
+            if e is not None:
+                msg_input = torch.cat([h[src], h[dst], e], dim=-1)
+            else:
+                msg_input = torch.cat([h[src], h[dst], torch.zeros(src.size(0), self.hidden_channels, device=h.device)], dim=-1)
+
+            # Run the edge MLP manually and aggregate
+            msg = self.edge_mlps[i](msg_input)
+
+            # Aggregate messages (max aggregation, matching EdgeConv)
+            agg = torch.zeros_like(h)
+            agg.scatter_reduce_(0, dst.unsqueeze(1).expand(-1, self.hidden_channels), msg, reduce="amax", include_self=False)
+
+            # Normalize
+            agg = norm(torch.relu(agg), batch)
+
+            # Gated residual update
+            gate_val = gate(torch.cat([h, agg], dim=-1))
+            h = h + gate_val * nn.functional.dropout(agg, p=self.dropout, training=self.training)
+
+        # Global pooling: concat(mean, max)
+        pooled_mean = global_mean_pool(h, batch)
+        pooled_max = global_max_pool(h, batch)
+        pooled = torch.cat([pooled_mean, pooled_max], dim=-1)
+
+        return self.readout(pooled)
+
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
