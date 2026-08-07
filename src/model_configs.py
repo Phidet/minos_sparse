@@ -307,6 +307,29 @@ MODEL_CONFIGS = {
         "max_events": 12000,
     },
 
+    "cnn_simplified_cross_attention_more_events": {
+        "model": SimplifiedDualViewCrossAttentionSparseCNN(
+            in_channels=1,
+            conv_channels=[32, 64],
+            fc_dims=[16],
+            dropout=0.1,
+            num_heads=8,
+        ),
+        "loss": nn.CrossEntropyLoss(),
+        "model_type": "cnn_simplified_cross_attention",
+        "model_name": "SimplifiedDualViewCrossAttentionSparseCNN",
+        "num_epochs": 12,
+        "lr": 1e-3,
+        "weight_decay": 1e-4,
+        "batch_size": 32,
+        "step_size": 3,
+        "gamma": 0.3,
+        "use_class_weights": False,
+        "use_energy_weights": False,
+        "feature_mode": "sum",
+        "max_events": 999999999,
+    },
+    
     "cnn_simplified_cross_attention_focal": {
         "model": SimplifiedDualViewCrossAttentionSparseCNN(
             in_channels=1,
