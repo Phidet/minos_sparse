@@ -148,9 +148,13 @@ def main():
         model_feature_mode = config.get("feature_mode", DATASET_CONFIG["feature_mode"])
         dataset = datasets[model_feature_mode]
 
+        criterion = config.get("loss", config.get("loss_fn", config.get("criterion", None)))
+        loss_name = criterion.__class__.__name__ if hasattr(criterion, "__class__") else str(criterion)
+
         print(f"\n[{idx}/{len(target_keys)}] Starting Training: {key} ({model_name})")
         print(f"    Epochs: {num_epochs} | LR: {lr:.1e} | Batch Size: {batch_size} | Weight Decay: {config.get('weight_decay', 1e-4)}")
         print(f"    LR Scheduler: StepLR(step_size={config.get('step_size', 3)}, gamma={config.get('gamma', 0.3)})")
+        print(f"    Loss Function: {loss_name}")
         print(f"    Feature Mode: {model_feature_mode}")
 
         train_loader, val_loader, _, _ = create_multiview_gnn_dataloaders(
@@ -193,6 +197,7 @@ def main():
             weight_decay=config.get("weight_decay", 1e-4),
             step_size=config.get("step_size", 3),
             gamma=config.get("gamma", 0.3),
+            criterion=criterion,
             class_weights=class_weights,
             use_energy_weighting=config.get("use_energy_weights", False),
             selection_metric="roc_auc",

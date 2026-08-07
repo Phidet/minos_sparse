@@ -42,6 +42,8 @@ from .model_configs import (
     MODEL_CONFIGS,
     DATASET_CONFIG,
     get_config,
+    BinaryFocalLoss,
+    FocalLoss,
 )
 from .trainer import (
     train_epoch,

@@ -11,6 +11,48 @@ GNN models use a ``model_factory`` callable because they need runtime
 (file paths, cache paths, split ratios, random seed, view geometry).
 """
 
+import torch
+import torch.nn as nn
+import torchvision.ops as ops
+
+
+class BinaryFocalLoss(nn.Module):
+    """
+    Binary Focal Loss implementation utilizing torchvision.ops.sigmoid_focal_loss.
+
+    Expects raw logits (without prior sigmoid) and binary target labels (0 or 1).
+    Supports 2-class logits shape (N, 2) by converting to binary logits (z1 - z0),
+    1-class logits shape (N, 1) or (N,), and target shape matching.
+    """
+
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = "mean"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if logits.ndim == 2 and logits.size(1) == 2:
+            binary_logits = logits[:, 1:2] - logits[:, 0:1]
+        else:
+            binary_logits = logits.view(-1, 1)
+
+        targets_float = targets.float().view_as(binary_logits)
+
+        loss = ops.sigmoid_focal_loss(
+            binary_logits,
+            targets_float,
+            alpha=self.alpha,
+            gamma=self.gamma,
+            reduction=self.reduction,
+        )
+        if self.reduction == "none" and loss.ndim > 1:
+            loss = loss.squeeze(-1)
+        return loss
+
+
+FocalLoss = BinaryFocalLoss
+
 from .models import (
     DualViewSparseCNN,
     SimplifiedDualViewSparseCNN,
@@ -67,6 +109,7 @@ MODEL_CONFIGS = {
             fc_dims=[16],
             dropout=0.1,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_dualview",
         "model_name": "DualViewSparseCNN",
         "num_epochs": 12,
@@ -88,6 +131,7 @@ MODEL_CONFIGS = {
             fc_dims=[16],
             dropout=0.1,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_simplified_dualview",
         "model_name": "SimplifiedDualViewSparseCNN",
         "num_epochs": 12,
@@ -109,6 +153,7 @@ MODEL_CONFIGS = {
             fc_dims=[16],
             dropout=0.1,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_dense",
         "model_name": "DualViewDenseCNN",
         "num_epochs": 12,
@@ -130,6 +175,7 @@ MODEL_CONFIGS = {
             fc_dims=[16],
             dropout=0.1,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_plane_summary",
         "model_name": "DualViewPlaneSummarySparseCNN",
         "num_epochs": 12,
@@ -154,6 +200,7 @@ MODEL_CONFIGS = {
             dropout=0.1,
             num_heads=8,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_cross_attention",
         "model_name": "DualViewCrossAttentionSparseCNN",
         "num_epochs": 12,
@@ -176,6 +223,7 @@ MODEL_CONFIGS = {
             dropout=0.1,
             num_heads=8,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_deep_cross_attention",
         "model_name": "DualViewDeepCrossAttentionSparseCNN",
         "num_epochs": 12,
@@ -198,6 +246,7 @@ MODEL_CONFIGS = {
             dropout=0.1,
             num_heads=8,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_resnet_cross_attention",
         "model_name": "DualViewResNetCrossAttentionSparseCNN",
         "num_epochs": 15,
@@ -220,6 +269,7 @@ MODEL_CONFIGS = {
             dropout=0.1,
             num_heads=8,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_transformer_cross_attention",
         "model_name": "DualViewTransformerCrossAttnSparseCNN",
         "num_epochs": 12,
@@ -242,7 +292,31 @@ MODEL_CONFIGS = {
             dropout=0.1,
             num_heads=8,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_simplified_cross_attention",
+        "model_name": "SimplifiedDualViewCrossAttentionSparseCNN",
+        "num_epochs": 12,
+        "lr": 1e-3,
+        "weight_decay": 1e-4,
+        "batch_size": 32,
+        "step_size": 3,
+        "gamma": 0.3,
+        "use_class_weights": False,
+        "use_energy_weights": False,
+        "feature_mode": "sum",
+        "max_events": 12000,
+    },
+
+    "cnn_simplified_cross_attention_focal": {
+        "model": SimplifiedDualViewCrossAttentionSparseCNN(
+            in_channels=1,
+            conv_channels=[32, 64],
+            fc_dims=[16],
+            dropout=0.1,
+            num_heads=8,
+        ),
+        "loss": BinaryFocalLoss(alpha=0.25, gamma=2.0),
+        "model_type": "cnn_simplified_cross_attention_focal",
         "model_name": "SimplifiedDualViewCrossAttentionSparseCNN",
         "num_epochs": 12,
         "lr": 1e-3,
@@ -264,6 +338,7 @@ MODEL_CONFIGS = {
             dropout=0.1,
             num_heads=8,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_positional_cross_attention",
         "model_name": "DualViewPositionalCrossAttentionSparseCNN",
         "num_epochs": 15,
@@ -286,6 +361,7 @@ MODEL_CONFIGS = {
             dropout=0.1,
             num_heads=8,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_multistage_cross_attention",
         "model_name": "DualViewMultiStageCrossAttentionSparseCNN",
         "num_epochs": 12,
@@ -309,6 +385,7 @@ MODEL_CONFIGS = {
             fc_dims=[16],
             dropout=0.1,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_3d_intersection",
         "model_name": "DualView3DIntersectionSparseCNN",
         "num_epochs": 12,
@@ -330,6 +407,7 @@ MODEL_CONFIGS = {
             fc_dims=[16],
             dropout=0.1,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_cross_gate",
         "model_name": "DualViewCrossGateSparseCNN",
         "num_epochs": 12,
@@ -352,6 +430,7 @@ MODEL_CONFIGS = {
             dropout=0.1,
             num_heads=8,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_hybrid_transformer",
         "model_name": "DualViewHybridTransformerSparseCNN",
         "num_epochs": 12,
@@ -375,6 +454,7 @@ MODEL_CONFIGS = {
             num_heads=8,
             num_transformer_layers=3,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_multilayer_transformer",
         "model_name": "DualViewMultiLayerTransformerSparseCNN",
         "num_epochs": 12,
@@ -397,6 +477,7 @@ MODEL_CONFIGS = {
             fc_dims=[16],
             dropout=0.1,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_zipper",
         "model_name": "DualViewZipperSparseCNN",
         "num_epochs": 12,
@@ -421,6 +502,7 @@ MODEL_CONFIGS = {
             dropout=0.1,
             num_heads=8,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_deep_resnet_cross_attention",
         "model_name": "DualViewDeepResNetCrossAttentionSparseCNN",
         "num_epochs": 15,
@@ -443,6 +525,7 @@ MODEL_CONFIGS = {
             dropout=0.1,
             num_heads=8,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_resnet_dual_pool_cross_attention",
         "model_name": "DualViewResNetDualPoolCrossAttentionSparseCNN",
         "num_epochs": 15,
@@ -465,6 +548,7 @@ MODEL_CONFIGS = {
             dropout=0.1,
             num_heads=8,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "model_type": "cnn_resnet_multistage_cross_attention",
         "model_name": "DualViewResNetMultiStageCrossAttentionSparseCNN",
         "num_epochs": 15,
@@ -489,6 +573,7 @@ MODEL_CONFIGS = {
             num_layers=4,
             dropout=0.1,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "is_gnn": True,
         "model_type": "gnn",
         "model_name": "MinimumViableMINOSGNN",
@@ -512,6 +597,7 @@ MODEL_CONFIGS = {
             num_layers=4,
             dropout=0.1,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "is_gnn": True,
         "model_type": "gnn_nugraph",
         "model_name": "NuGraphInspiredBinaryGNN",
@@ -535,6 +621,7 @@ MODEL_CONFIGS = {
             num_layers=3,
             dropout=0.15,
         ),
+        "loss": nn.CrossEntropyLoss(),
         "is_gnn": True,
         "model_type": "gnn_timing",
         "model_name": "TimingAwareGNN",

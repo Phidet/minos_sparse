@@ -150,17 +150,42 @@ def compute_batch_loss(
     use_energy_weighting: bool = False,
     energy_epsilon: float = 0.5,
     energy_alpha: float = 1.0,
+    criterion: Optional[Any] = None,
 ) -> torch.Tensor:
-    per_sample_loss = nn.functional.cross_entropy(logits, labels, reduction="none")
-    sample_weights = compute_sample_weights(
-        labels=labels,
-        energies=energies,
-        class_weights=class_weights,
-        use_energy_weighting=use_energy_weighting,
-        energy_epsilon=energy_epsilon,
-        energy_alpha=energy_alpha,
-    )
-    return (per_sample_loss * sample_weights).mean()
+    if criterion is None:
+        criterion = nn.CrossEntropyLoss()
+
+    has_custom_weighting = use_energy_weighting or (class_weights is not None)
+
+    if has_custom_weighting:
+        sample_weights = compute_sample_weights(
+            labels=labels,
+            energies=energies,
+            class_weights=class_weights,
+            use_energy_weighting=use_energy_weighting,
+            energy_epsilon=energy_epsilon,
+            energy_alpha=energy_alpha,
+        )
+        if isinstance(criterion, nn.CrossEntropyLoss) or criterion in ("cross_entropy", "ce"):
+            per_sample_loss = nn.functional.cross_entropy(logits, labels, reduction="none")
+        elif callable(criterion):
+            try:
+                per_sample_loss = criterion(logits, labels)
+                if per_sample_loss.ndim == 0:
+                    return per_sample_loss * sample_weights.mean()
+            except Exception:
+                per_sample_loss = nn.functional.cross_entropy(logits, labels, reduction="none")
+        else:
+            per_sample_loss = nn.functional.cross_entropy(logits, labels, reduction="none")
+
+        return (per_sample_loss * sample_weights).mean()
+    else:
+        if isinstance(criterion, str):
+            if criterion in ["cross_entropy", "ce"]:
+                criterion = nn.CrossEntropyLoss()
+            else:
+                raise ValueError(f"Unknown loss string '{criterion}'")
+        return criterion(logits, labels)
 
 
 def _forward_batch(model: nn.Module, batch, device: torch.device):
@@ -208,7 +233,7 @@ def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    criterion: Optional[nn.Module] = None,
+    criterion: Optional[Any] = None,
     device: torch.device = torch.device("cpu"),
     class_weights: Optional[torch.Tensor] = None,
     use_energy_weighting: bool = False,
@@ -218,6 +243,8 @@ def train_epoch(
     model = model.to(device)
     if class_weights is not None:
         class_weights = class_weights.to(device)
+    if isinstance(criterion, nn.Module):
+        criterion = criterion.to(device)
     model.train()
     total_loss = 0.0
     all_preds = []
@@ -228,16 +255,14 @@ def train_epoch(
         batch_size = labels.size(0)
 
         optimizer.zero_grad()
-        if use_energy_weighting or class_weights is not None or criterion is None:
-            loss = compute_batch_loss(
-                logits, labels, energies,
-                class_weights=class_weights,
-                use_energy_weighting=use_energy_weighting,
-                energy_epsilon=energy_epsilon,
-                energy_alpha=energy_alpha,
-            )
-        else:
-            loss = criterion(logits, labels)
+        loss = compute_batch_loss(
+            logits, labels, energies,
+            class_weights=class_weights,
+            use_energy_weighting=use_energy_weighting,
+            energy_epsilon=energy_epsilon,
+            energy_alpha=energy_alpha,
+            criterion=criterion,
+        )
 
         loss.backward()
         optimizer.step()
@@ -256,7 +281,7 @@ def train_epoch(
 def validate_epoch(
     model: nn.Module,
     loader: DataLoader,
-    criterion: Optional[nn.Module] = None,
+    criterion: Optional[Any] = None,
     device: torch.device = torch.device("cpu"),
     class_weights: Optional[torch.Tensor] = None,
     use_energy_weighting: bool = False,
@@ -268,6 +293,8 @@ def validate_epoch(
     model = model.to(device)
     if class_weights is not None:
         class_weights = class_weights.to(device)
+    if isinstance(criterion, nn.Module):
+        criterion = criterion.to(device)
     model.eval()
     total_loss = 0.0
     all_probs = []
@@ -278,16 +305,14 @@ def validate_epoch(
             logits, labels, energies = _forward_batch(model, batch, device)
             batch_size = labels.size(0)
 
-            if use_energy_weighting or class_weights is not None or criterion is None:
-                loss = compute_batch_loss(
-                    logits, labels, energies,
-                    class_weights=class_weights,
-                    use_energy_weighting=use_energy_weighting,
-                    energy_epsilon=energy_epsilon,
-                    energy_alpha=energy_alpha,
-                )
-            else:
-                loss = criterion(logits, labels)
+            loss = compute_batch_loss(
+                logits, labels, energies,
+                class_weights=class_weights,
+                use_energy_weighting=use_energy_weighting,
+                energy_epsilon=energy_epsilon,
+                energy_alpha=energy_alpha,
+                criterion=criterion,
+            )
 
             total_loss += loss.item() * batch_size
             probs = torch.softmax(logits, dim=1)[:, 1]
@@ -317,6 +342,7 @@ def train_model(
     weight_decay: float = 1e-4,
     step_size: int = 3,
     gamma: float = 0.1,
+    criterion: Optional[Any] = None,
     class_weights: Optional[torch.Tensor] = None,
     use_energy_weighting: bool = False,
     energy_epsilon: float = 0.5,
@@ -331,6 +357,11 @@ def train_model(
     model = model.to(device)
     if class_weights is not None:
         class_weights = class_weights.to(device)
+
+    if criterion is None:
+        criterion = nn.CrossEntropyLoss()
+    if isinstance(criterion, nn.Module):
+        criterion = criterion.to(device)
 
     optimizer = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = StepLR(optimizer, step_size=step_size, gamma=gamma)
@@ -351,6 +382,8 @@ def train_model(
 
     if verbose:
         print(f"Starting model training on {device} ({num_epochs} epochs)...")
+        loss_name = criterion.__class__.__name__ if hasattr(criterion, '__class__') else str(criterion)
+        print(f"Loss Function: {loss_name}")
         print(f"Best Model Selection Metric: '{target_metric}'")
 
         if use_energy_weighting:
@@ -362,12 +395,14 @@ def train_model(
         current_lr = optimizer.param_groups[0]["lr"]
         tr_loss, tr_acc = train_epoch(
             model, train_loader, optimizer,
+            criterion=criterion,
             device=device, class_weights=class_weights,
             use_energy_weighting=use_energy_weighting,
             energy_epsilon=energy_epsilon, energy_alpha=energy_alpha,
         )
         val_loss, val_acc, val_metrics, _, _ = validate_epoch(
             model, val_loader,
+            criterion=criterion,
             device=device, class_weights=class_weights,
             use_energy_weighting=use_energy_weighting,
             energy_epsilon=energy_epsilon, energy_alpha=energy_alpha,
@@ -430,7 +465,6 @@ def train_model(
         )
 
     return history, best_metrics
-
 
 
 def auto_commit_and_get_hash(commit_msg: Optional[str] = None) -> str:
@@ -503,6 +537,13 @@ def save_model_checkpoint(
             continue  # skip nn.Module instances
         safe_config[k] = v
 
+    if "loss" in config:
+        loss_val = config["loss"]
+        if isinstance(loss_val, nn.Module):
+            safe_config["loss"] = loss_val.__class__.__name__
+        else:
+            safe_config["loss"] = str(loss_val)
+
     checkpoint = {
         "model_type": model_type,
         "model_state_dict": model.state_dict(),
@@ -514,6 +555,7 @@ def save_model_checkpoint(
     }
     torch.save(checkpoint, filepath)
     print(f"Saved trained model checkpoint to: {filepath}")
+    return filepath
     return filepath
 
 
