@@ -316,7 +316,7 @@ MODEL_CONFIGS = {
             num_heads=8,
         ),
         "loss": nn.CrossEntropyLoss(),
-        "model_type": "cnn_simplified_cross_attention",
+        "model_type": "cnn_simplified_cross_attention_more_events",
         "model_name": "SimplifiedDualViewCrossAttentionSparseCNN",
         "num_epochs": 12,
         "lr": 1e-3,
