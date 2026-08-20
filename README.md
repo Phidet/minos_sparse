@@ -1,7 +1,7 @@
 # MINOS CC/NC Event Classification
 
 PyTorch pipeline for classifying MINOS neutrino events as Charged Current (CC)
-vs. Neutral Current (NC), from raw ROOT files through sparse-CNN, GNN, and
+vs. Neutral Current (NC) through sparse-CNN, GNN, and
 transformer models.
 
 ---
