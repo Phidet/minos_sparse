@@ -24,4 +24,15 @@ saved_models/*.pt
 # VSCode Jupyter Plotly output (regenerated on cell re-run)
 iframe_figures/
 
+# Kept locally but not tracked: historical record / research notebooks and
+# scripts not part of the train -> evaluate pipeline (see README)
+model_leaderboard_archive.csv
+minos_event_display_2d.ipynb
+minos_event_display_3d.ipynb
+scripts/compare_models.py
+scripts/diagnose_timing_availability.py
+scripts/evaluate_by_energy.py
+scripts/evaluate_hit_head.py
+scripts/verify_hitset.py
+
 
