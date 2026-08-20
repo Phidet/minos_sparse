@@ -7,9 +7,9 @@ auto-commits repository state before starting, saves checkpoints with training h
 and logs metrics to model_leaderboard.csv.
 
 Usage examples:
-    python train.py --models cnn_resnet_cross_attention cnn_cross_attention
-    python train.py --all
-    python train.py --models gnn_nugraph --num_epochs 15 --max_events 5000
+    python train.py --sntp path/to/file.sntp.root --models cnn_resnet_cross_attention cnn_cross_attention
+    python train.py --sntp path/to/file.sntp.root --all
+    python train.py --sntp path/to/file.sntp.root --models gnn_nugraph --num_epochs 15 --max_events 5000
 """
 
 import sys
@@ -38,6 +38,11 @@ from src import (
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train MINOS event classification models")
+    parser.add_argument(
+        "--sntp", type=str, required=True,
+        help="Path to the MINOS sntp ROOT file, e.g. f21048000_0000_L010185N_D07_r3.sntp.dogwood5.0.root "
+             "(only actually read if no cache exists yet for the requested feature_mode)"
+    )
     parser.add_argument(
         "--models", "-m", nargs="+", type=str, default=None,
         help="List of model configuration keys to train (e.g. cnn_resnet_cross_attention gnn_nugraph)"
@@ -140,7 +145,7 @@ def main():
 
         print(f"Loading MINOS dataset (max_events={max_events}, feature_mode='{mode}', ablate_timing={ablate_timing}, cache_path='{cache_path}')...")
         datasets[cache_path] = MINOSMultiViewGraphDataset(
-            root_filepath=DATASET_CONFIG["root_filepath"],
+            root_filepath=args.sntp,
             max_events=max_events,
             view_ids=DATASET_CONFIG["view_ids"],
             plane_radius=DATASET_CONFIG["plane_radius"],

@@ -82,8 +82,10 @@ from .models import (
 
 
 # ── Shared dataset / infrastructure settings ─────────────────────────
+# root_filepath is deliberately absent: it's machine-specific, so it's
+# supplied at the call site instead (train.py's --sntp flag; set a
+# ROOT_FILEPATH variable when working in a notebook).
 DATASET_CONFIG = {
-    "root_filepath": "f21048000_0000_L010185N_D07_r3.sntp.dogwood5.0.root",
     "cache_path": "data/cache/minos_uview_multi_view_graph_dual_ph.pt",
     "view_ids": (2, 3),
     "plane_radius": 1,
