@@ -10,22 +10,14 @@ transformer models.
 
 ```bash
 uv sync
-uv run python train.py --sntp path/to/your_file.sntp.root --models gnn_timing_aux
+uv run python train.py --sntp path/to/your_MINOS_file.sntp.root --models gnn_timing_aux
 ```
 
-`--sntp` points at your MINOS sntp ROOT file — there's no default or bundled
-copy, so it's required. It's only actually opened if no cache exists yet for
-the requested model's `feature_mode`; once a cache is built (in `data/cache/`)
-subsequent runs read from it directly.
-
 Then explore results — leaderboard, curves, event displays, ROC/confusion
-matrix — in [`evaluate.ipynb`](evaluate.ipynb). The notebook takes the same
-path via a `ROOT_FILEPATH` variable near the top (cell 2) — set it there.
-
+matrix — in [`evaluate.ipynb`](evaluate.ipynb).
 ## Models
 
-Model configs live in `src/model_configs.py` (`MODEL_CONFIGS`); pick one with
-`train.py --models <name>` or train everything with `--all`. Three families:
+Model configs live in `src/model_configs.py` (`MODEL_CONFIGS`); pick a few or train everything with `--all`. Three families:
 
 - **`cnn_*`** — TorchSparse dual-view sparse CNNs (dense, cross-attention,
   ResNet, transformer, and other fusion variants).
