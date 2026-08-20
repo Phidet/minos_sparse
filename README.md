@@ -13,8 +13,8 @@ uv sync
 uv run python train.py --sntp path/to/your_MINOS_file.sntp.root --models gnn_timing_aux
 ```
 
-Then explore results — leaderboard, curves, event displays, ROC/confusion
-matrix — in [`evaluate.ipynb`](evaluate.ipynb).
+Show results (leaderboard, curves, event displays, ROC/confusion
+matrix) with [`evaluate.ipynb`](evaluate.ipynb).
 ## Models
 
 Model configs live in `src/model_configs.py` (`MODEL_CONFIGS`); pick a few or train everything with `--all`. Three families:
