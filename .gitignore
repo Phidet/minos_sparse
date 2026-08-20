@@ -21,4 +21,7 @@ saved_models/*.pt
 # Auto-generated backups (see _migrate_leaderboard_header in src/trainer.py)
 *.csv.bak
 
+# VSCode Jupyter Plotly output (regenerated on cell re-run)
+iframe_figures/
+
 
