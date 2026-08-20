@@ -13,6 +13,9 @@ uv sync
 uv run python train.py --models gnn_timing_aux
 ```
 
+Then explore results — leaderboard, curves, event displays, ROC/confusion
+matrix — in [`evaluate.ipynb`](evaluate.ipynb).
+
 ## Models
 
 Model configs live in `src/model_configs.py` (`MODEL_CONFIGS`); pick one with
