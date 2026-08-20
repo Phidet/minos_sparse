@@ -3,11 +3,13 @@ import torch
 import torch.nn as nn
 
 from src.torchsparse import SparseTensor
+from src.dataset import get_hit_lepton_frac, get_has_lepton_truth
 import src.torchsparse.nn as spnn
 
 try:
     from torch_geometric.nn import HeteroConv, SAGEConv, global_mean_pool, global_max_pool, EdgeConv, GraphNorm
     from torch_geometric.data import HeteroData
+    from torch_geometric.utils import to_dense_batch
 except ImportError:
     HeteroConv = None
     SAGEConv = None
@@ -16,6 +18,7 @@ except ImportError:
     EdgeConv = None
     GraphNorm = None
     HeteroData = None
+    to_dense_batch = None
 
 
 
@@ -3503,6 +3506,7 @@ class TimingAwareGNN(nn.Module):
         num_layers: int = 3,
         num_classes: int = 2,
         dropout: float = 0.15,
+        aux_weight: float = 0.0,
     ):
         super().__init__()
 
@@ -3566,7 +3570,34 @@ class TimingAwareGNN(nn.Module):
             nn.Linear(hidden_channels // 2, num_classes),
         )
 
-    def forward(self, data) -> torch.Tensor:
+        # Optional auxiliary per-hit primary-lepton head.
+        #
+        # Constructed LAST and only when enabled, which matters for two reasons:
+        #   * With aux_weight=0.0 (the default) the module is bit-identical to the
+        #     original: same state_dict keys, same 53,738 params, same init. The
+        #     existing gnn_timing / gnn_timing_v1_on_v3 configs and their saved
+        #     checkpoints keep working untouched.
+        #   * Because nothing is drawn from the RNG before this point that wasn't
+        #     drawn before, every shared layer initialises identically with and
+        #     without the head. So the already-trained gnn_timing_v1_on_v3
+        #     (0.9324, seed 42) is an exactly matched control for the aux run --
+        #     no separate control training needed.
+        #
+        # Note the `convs` ModuleList above is never called in forward(), but its
+        # construction is NOT removable: EdgeConv.__init__ calls reset_parameters()
+        # on the MLP handed to it, so `convs[i].nn IS edge_mlps[i]` (they share
+        # parameters -- all 53,738 are live) and dropping it would re-roll the
+        # initialisation of every later layer.
+        self.aux_weight = float(aux_weight)
+        if self.aux_weight > 0.0:
+            self.hit_head = nn.Sequential(
+                nn.Linear(hidden_channels, hidden_channels // 2),
+                nn.SiLU(),
+                nn.Linear(hidden_channels // 2, 1),
+            )
+
+    def _encode_nodes(self, data) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Message-passing body, shared by forward() and predict_hit_lepton_prob()."""
         x = data.x
         edge_index = data.edge_index
         edge_attr = data.edge_attr
@@ -3606,7 +3637,193 @@ class TimingAwareGNN(nn.Module):
             gate_val = gate(torch.cat([h, agg], dim=-1))
             h = h + gate_val * nn.functional.dropout(agg, p=self.dropout, training=self.training)
 
+        return h, batch
+
+    def forward(self, data):
+        h, batch = self._encode_nodes(data)
+
         # Global pooling: concat(mean, max)
+        pooled_mean = global_mean_pool(h, batch)
+        pooled_max = global_max_pool(h, batch)
+        pooled = torch.cat([pooled_mean, pooled_max], dim=-1)
+        logits = self.readout(pooled)
+
+        if self.training and self.aux_weight > 0.0:
+            return logits, self.aux_weight * self._aux_loss(h, batch, data)
+        return logits
+
+    def _aux_loss(self, h: torch.Tensor, batch: torch.Tensor, data) -> torch.Tensor:
+        """
+        Masked soft-target BCE over nodes, averaged per event then across events.
+
+        Simpler than the transformer's equivalent: PyG concatenates node
+        attributes, so ``hit_lepton_frac`` is already aligned with ``h`` -- no dense
+        padding, no mask, no truncation. Only ``has_lepton_truth`` (per graph) needs
+        broadcasting to nodes.
+        """
+        target = get_hit_lepton_frac(data).view(-1)
+        has_truth = get_has_lepton_truth(data, required=False)
+        if has_truth is None:
+            node_ok = torch.ones_like(target, dtype=torch.bool)
+        else:
+            node_ok = has_truth.view(-1).bool()[batch]
+
+        if not bool(node_ok.any()):
+            return h.sum() * 0.0
+
+        hit_logits = self.hit_head(h).squeeze(-1)
+        per_hit = nn.functional.binary_cross_entropy_with_logits(
+            hit_logits, target, reduction="none"
+        ) * node_ok.to(h.dtype)
+
+        n_graphs = int(batch.max()) + 1
+        sums = torch.zeros(n_graphs, device=h.device, dtype=h.dtype).index_add_(0, batch, per_hit)
+        counts = torch.zeros(n_graphs, device=h.device, dtype=h.dtype).index_add_(
+            0, batch, node_ok.to(h.dtype)
+        )
+        keep = counts > 0
+        return (sums[keep] / counts[keep]).mean()
+
+    @torch.no_grad()
+    def predict_hit_lepton_prob(self, data) -> torch.Tensor:
+        """
+        Per-hit primary-lepton probability, node-indexed (aligned with ``data.x``).
+
+        This is the output that makes the model checkable against real data --
+        it can be validated on FD cosmic and rock muons and on muon-removed
+        control samples, which an event-level score cannot.
+        """
+        if self.aux_weight <= 0.0:
+            raise RuntimeError(
+                "This model was built with aux_weight=0.0 and has no hit head."
+            )
+        self.eval()
+        h, _ = self._encode_nodes(data)
+        return torch.sigmoid(self.hit_head(h).squeeze(-1))
+
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class TimingAwareGNNV2(nn.Module):
+    """
+    Correctness-fixed copy of TimingAwareGNN, added as a separate class rather
+    than editing TimingAwareGNN in place so the original (currently the #1
+    leaderboard entry) stays reproducible against its logged checkpoint/row.
+
+    Two fixes relative to TimingAwareGNN:
+      1. Removes the dead `self.convs` ModuleList of `EdgeConv` layers, which
+         was constructed in TimingAwareGNN.__init__ but never called in
+         forward() (message passing was already done by a hand-rolled
+         duplicate of the same computation).
+      2. Edge embeddings are now refined every layer via an `edge_update` MLP
+         that recomputes each edge's embedding from the freshly updated
+         endpoint node states, instead of being computed once before the
+         layer loop and reused unchanged across all `num_layers` "stacked"
+         layers.
+
+    Node/edge feature layout is unchanged from TimingAwareGNN (see that
+    class's docstring).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 9,
+        edge_dim: int = 6,
+        hidden_channels: int = 48,
+        num_layers: int = 3,
+        num_classes: int = 2,
+        dropout: float = 0.15,
+    ):
+        super().__init__()
+
+        if global_mean_pool is None or global_max_pool is None or GraphNorm is None:
+            raise ImportError(
+                "torch_geometric is required for TimingAwareGNNV2. "
+                "Install PyTorch Geometric to use this model."
+            )
+
+        self.hidden_channels = hidden_channels
+        self.num_layers = num_layers
+        self.dropout = dropout
+
+        self.node_encoder = nn.Sequential(
+            nn.Linear(in_channels, hidden_channels),
+            nn.SiLU(),
+            nn.Linear(hidden_channels, hidden_channels),
+        )
+
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(edge_dim, hidden_channels),
+            nn.SiLU(),
+            nn.Linear(hidden_channels, hidden_channels),
+        )
+
+        self.norms = nn.ModuleList()
+        self.gates = nn.ModuleList()
+        self.edge_mlps = nn.ModuleList()
+        self.edge_updates = nn.ModuleList()
+
+        for _ in range(num_layers):
+            self.edge_mlps.append(nn.Sequential(
+                nn.Linear(3 * hidden_channels, hidden_channels),
+                nn.SiLU(),
+                nn.Linear(hidden_channels, hidden_channels),
+            ))
+            self.norms.append(GraphNorm(hidden_channels))
+            self.gates.append(nn.Sequential(
+                nn.Linear(2 * hidden_channels, hidden_channels),
+                nn.Sigmoid(),
+            ))
+            self.edge_updates.append(nn.Sequential(
+                nn.Linear(3 * hidden_channels, hidden_channels),
+                nn.SiLU(),
+                nn.Linear(hidden_channels, hidden_channels),
+            ))
+
+        pooled_dim = hidden_channels * 2
+        self.readout = nn.Sequential(
+            nn.Linear(pooled_dim, hidden_channels),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels, hidden_channels // 2),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_channels // 2, num_classes),
+        )
+
+    def forward(self, data) -> torch.Tensor:
+        x = data.x
+        edge_index = data.edge_index
+        edge_attr = data.edge_attr
+        batch = getattr(data, "batch", None)
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        h = self.node_encoder(x)
+        e = self.edge_encoder(edge_attr) if edge_attr is not None else torch.zeros(
+            edge_index.size(1), self.hidden_channels, device=h.device
+        )
+
+        src, dst = edge_index[0], edge_index[1]
+
+        for i in range(self.num_layers):
+            msg_input = torch.cat([h[src], h[dst], e], dim=-1)
+            msg = self.edge_mlps[i](msg_input)
+
+            agg = torch.zeros_like(h)
+            agg.scatter_reduce_(0, dst.unsqueeze(1).expand(-1, self.hidden_channels), msg, reduce="amax", include_self=False)
+
+            agg = self.norms[i](torch.relu(agg), batch)
+
+            gate_val = self.gates[i](torch.cat([h, agg], dim=-1))
+            h = h + gate_val * nn.functional.dropout(agg, p=self.dropout, training=self.training)
+
+            # Refine edge embeddings using the updated endpoint states so edge
+            # (i.e. timing-pair) representations evolve with depth like node
+            # features do, instead of staying frozen at their layer-0 encoding.
+            e = self.edge_updates[i](torch.cat([h[src], h[dst], e], dim=-1))
+
         pooled_mean = global_mean_pool(h, batch)
         pooled_max = global_max_pool(h, batch)
         pooled = torch.cat([pooled_mean, pooled_max], dim=-1)
@@ -3616,3 +3833,310 @@ class TimingAwareGNN(nn.Module):
     def get_num_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+
+
+# ── Hit-level set transformer (feature_mode='hitset') ────────────────────
+
+class _HitSetBlock(nn.Module):
+    """Pre-LN encoder block over strip tokens, with an additive attention bias."""
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float, ff_mult: int = 2):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, ff_mult * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_mult * d_model, d_model),
+        )
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        h = self.norm1(x)
+        a, _ = self.attn(h, h, h, attn_mask=attn_mask, need_weights=False)
+        x = x + self.drop(a)
+        x = x + self.ff(self.norm2(x))
+        return x
+
+
+class HitSetTransformer(nn.Module):
+    """
+    Transformer over the set of calibrated strips in a Far Detector snarl,
+    consuming ``feature_mode='hitset'`` events (edgeless homogeneous ``Data``,
+    14 features per hit -- see ``MINOSMultiViewGraphDataset``).
+
+    Motivation. 25 prior leaderboard runs spanning sparse CNNs, dense CNNs,
+    cross-attention and two GNN families all land in ROC-AUC 0.924-0.940, and
+    the gnn_timing_v3 ablation shows the timing features contribute ~nothing.
+    Architecture and statistics are both exhausted, so the point of this model
+    is not the architecture -- it is the auxiliary head. ``thstp`` supplies a
+    soft per-strip primary-lepton charge fraction, turning one bit of
+    supervision per event into 50-400 targets per event. A diagnostic oracle
+    that simply counts truth-tagged hits reaches ROC-AUC 0.9901, versus 0.9396
+    for the best current model, so the information is present at strip level
+    and is not being extracted.
+
+    ``aux_weight`` switches the segmentation head:
+      * ``0.0`` -- event head only; the architecture-swap control.
+      * ``> 0`` -- adds ``aux_weight * BCE(hit_logits, hit_lepton_frac)``.
+
+    The aux loss is computed only in ``training`` mode, so ``val_loss`` stays
+    the event loss alone and remains comparable with every other leaderboard
+    row.
+
+    Two design choices are worth flagging:
+
+    * **Pairwise attention bias** (``use_pair_bias``). Muon-vs-shower is a
+      statement about *relative* structure -- a muon is a chain of hits with
+      small plane-to-plane steps in ``tpos`` and a consistent dt/dz. A bias
+      built from (dz, dtpos, dt, same_view, dplane, |dr|) is added to the
+      attention logits so that relation is directly available rather than
+      having to be inferred from absolute coordinates. It is computed once and
+      reused across all blocks (as in Particle Transformer), which keeps it
+      affordable on CPU.
+    * **Truncation.** Events longer than ``max_hits`` keep their first
+      ``max_hits`` tokens. The dataset sorts hits by (z, tpos), so this retains
+      the upstream vertex region and the start of the track. At the default 256
+      this affects ~13% of events (longest observed: 1008 hits).
+    """
+
+    # Column indices into the 14-feature hit vector built by
+    # MINOSMultiViewGraphDataset._build_hitset_event.
+    _IDX_T = 2
+    _IDX_TPOS = 4
+    _IDX_Z = 5
+    _IDX_VIEW = 6
+
+    # z_norm = (z_metres - 15) / 15 and the MINOS plane pitch is 5.94 cm, so
+    # one plane step is 0.0594 / 15 in normalised units. Converting dz back to
+    # an approximate plane count keeps the pair-bias MLP well conditioned --
+    # adjacent planes differ by ~0.004 in z_norm, which would otherwise be
+    # numerically indistinguishable from zero at initialisation.
+    _PLANES_PER_ZNORM = 15.0 / 0.0594
+
+    def __init__(
+        self,
+        in_channels: int = 14,
+        d_model: int = 64,
+        num_layers: int = 4,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        max_hits: int = 256,
+        use_pair_bias: bool = True,
+        pair_hidden: int = 8,
+        num_freqs: int = 4,
+        aux_weight: float = 0.0,
+        num_classes: int = 2,
+    ):
+        super().__init__()
+
+        if to_dense_batch is None:
+            raise ImportError(
+                "torch_geometric is required for HitSetTransformer. "
+                "Install PyTorch Geometric to use this model."
+            )
+
+        self.in_channels = in_channels
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.max_hits = max_hits
+        self.use_pair_bias = use_pair_bias
+        self.num_freqs = num_freqs
+        self.aux_weight = float(aux_weight)
+
+        # Fourier features for z and tpos (attention handles geometry better in
+        # a periodic basis than from raw scalars).
+        self.register_buffer(
+            "_freqs", (2.0 ** torch.arange(num_freqs)) * torch.pi, persistent=False
+        )
+        input_dim = in_channels + 4 * num_freqs
+
+        self.input_proj = nn.Sequential(
+            nn.Linear(input_dim, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+        if use_pair_bias:
+            self.pair_mlp = nn.Sequential(
+                nn.Linear(6, pair_hidden),
+                nn.GELU(),
+                nn.Linear(pair_hidden, num_heads),
+            )
+
+        self.blocks = nn.ModuleList([
+            _HitSetBlock(d_model, num_heads, dropout) for _ in range(num_layers)
+        ])
+        self.norm_out = nn.LayerNorm(d_model)
+
+        # CLS + masked mean + masked max, mirroring the dual-pool readout used
+        # by TimingAwareGNNV2.
+        self.event_head = nn.Sequential(
+            nn.Linear(3 * d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, num_classes),
+        )
+        self.hit_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1),
+        )
+
+    def _fourier(self, v: torch.Tensor) -> torch.Tensor:
+        """[B, N] -> [B, N, 2 * num_freqs]."""
+        a = v.unsqueeze(-1) * self._freqs
+        return torch.cat([torch.sin(a), torch.cos(a)], dim=-1)
+
+    def _pair_bias(self, dense: torch.Tensor) -> torch.Tensor:
+        """[B, N, F] -> [B, heads, N, N] additive attention bias."""
+        z = dense[..., self._IDX_Z]
+        tp = dense[..., self._IDX_TPOS]
+        t = dense[..., self._IDX_T]
+        view = dense[..., self._IDX_VIEW]
+
+        dz = z.unsqueeze(-1) - z.unsqueeze(-2)
+        dtp = tp.unsqueeze(-1) - tp.unsqueeze(-2)
+        dt = t.unsqueeze(-1) - t.unsqueeze(-2)
+        same_view = (view.unsqueeze(-1) == view.unsqueeze(-2)).float()
+        dplane = torch.clamp(dz * self._PLANES_PER_ZNORM, -20.0, 20.0) / 20.0
+        dr = torch.sqrt(dz * dz + dtp * dtp + 1e-12)
+
+        pair = torch.stack([dz, dtp, dt, same_view, dplane, dr], dim=-1)
+        return self.pair_mlp(pair).permute(0, 3, 1, 2)
+
+    def _aux_loss(
+        self,
+        hit_logits: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+        has_truth: torch.Tensor,
+    ) -> torch.Tensor:
+        """Masked soft-target BCE, averaged per event then across events."""
+        valid = mask & has_truth.view(-1, 1)
+        counts = valid.sum(dim=1)
+        keep = counts > 0
+        if not bool(keep.any()):
+            return hit_logits.sum() * 0.0
+
+        per_hit = nn.functional.binary_cross_entropy_with_logits(
+            hit_logits, target, reduction="none"
+        ) * valid.float()
+        per_event = per_hit.sum(dim=1)[keep] / counts[keep].float()
+        return per_event.mean()
+
+    def forward(self, data):
+        x = data.x
+        batch = getattr(data, "batch", None)
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        dense, mask = to_dense_batch(x, batch, max_num_nodes=self.max_hits)
+        B, N, _ = dense.shape
+
+        feats = torch.cat(
+            [
+                dense,
+                self._fourier(dense[..., self._IDX_Z]),
+                self._fourier(dense[..., self._IDX_TPOS]),
+            ],
+            dim=-1,
+        )
+        tokens = self.input_proj(feats)
+        seq = torch.cat([self.cls_token.expand(B, -1, -1), tokens], dim=1)
+
+        # The CLS token is never padding, so no query row is fully masked and
+        # the softmax cannot produce NaN.
+        seq_mask = torch.cat(
+            [torch.ones(B, 1, dtype=torch.bool, device=mask.device), mask], dim=1
+        )
+
+        L = N + 1
+        bias = torch.zeros(B, self.num_heads, L, L, device=dense.device, dtype=dense.dtype)
+        if self.use_pair_bias:
+            bias[:, :, 1:, 1:] = self._pair_bias(dense)
+        # Fold padding into the float bias rather than passing a separate bool
+        # key_padding_mask (mixing mask dtypes is deprecated in torch>=2.1).
+        bias = bias.masked_fill(~seq_mask[:, None, None, :], float("-inf"))
+        attn_mask = bias.reshape(B * self.num_heads, L, L)
+
+        for blk in self.blocks:
+            seq = blk(seq, attn_mask)
+        seq = self.norm_out(seq)
+
+        cls_out = seq[:, 0]
+        tok = seq[:, 1:]
+        m = mask.unsqueeze(-1).to(tok.dtype)
+        pooled_mean = (tok * m).sum(dim=1) / m.sum(dim=1).clamp(min=1.0)
+        pooled_max = tok.masked_fill(~mask.unsqueeze(-1), float("-inf")).max(dim=1).values
+        logits = self.event_head(torch.cat([cls_out, pooled_mean, pooled_max], dim=-1))
+
+        if self.training and self.aux_weight > 0.0:
+            target, _ = to_dense_batch(
+                get_hit_lepton_frac(data).unsqueeze(-1), batch, max_num_nodes=self.max_hits
+            )
+            has_truth = get_has_lepton_truth(data, required=False)
+            if has_truth is None:
+                has_truth = torch.ones(B, dtype=torch.bool, device=x.device)
+            aux = self._aux_loss(
+                self.hit_head(tok).squeeze(-1),
+                target.squeeze(-1),
+                mask,
+                has_truth.view(-1).bool(),
+            )
+            return logits, self.aux_weight * aux
+
+        return logits
+
+    @torch.no_grad()
+    def predict_hit_lepton_prob(self, data) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Per-hit primary-lepton probability, for validating the segmentation
+        head against control samples and for deriving interpretable
+        muon-chain variables. Returns ``(probs [B, N], mask [B, N])``.
+        """
+        self.eval()
+        x = data.x
+        batch = getattr(data, "batch", None)
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
+        dense, mask = to_dense_batch(x, batch, max_num_nodes=self.max_hits)
+        B, N, _ = dense.shape
+        feats = torch.cat(
+            [
+                dense,
+                self._fourier(dense[..., self._IDX_Z]),
+                self._fourier(dense[..., self._IDX_TPOS]),
+            ],
+            dim=-1,
+        )
+        seq = torch.cat(
+            [self.cls_token.expand(B, -1, -1), self.input_proj(feats)], dim=1
+        )
+        seq_mask = torch.cat(
+            [torch.ones(B, 1, dtype=torch.bool, device=mask.device), mask], dim=1
+        )
+        L = N + 1
+        bias = torch.zeros(B, self.num_heads, L, L, device=dense.device, dtype=dense.dtype)
+        if self.use_pair_bias:
+            bias[:, :, 1:, 1:] = self._pair_bias(dense)
+        bias = bias.masked_fill(~seq_mask[:, None, None, :], float("-inf"))
+        attn_mask = bias.reshape(B * self.num_heads, L, L)
+
+        for blk in self.blocks:
+            seq = blk(seq, attn_mask)
+        seq = self.norm_out(seq)
+        return torch.sigmoid(self.hit_head(seq[:, 1:]).squeeze(-1)), mask
+
+    def get_num_params(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)

@@ -2,6 +2,7 @@ import time
 import os
 import copy
 import csv
+import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
@@ -188,7 +189,24 @@ def compute_batch_loss(
         return criterion(logits, labels)
 
 
+def _split_model_output(out):
+    """
+    Unpack a model's forward() return into ``(logits, aux_loss)``.
+
+    Models with an auxiliary head (currently HitSetTransformer's per-hit
+    primary-lepton segmentation head) return ``(logits, aux_loss)`` while
+    training and a bare logits tensor otherwise. Every other model in
+    src/models.py returns a bare tensor always, so they take the second branch
+    and are unaffected.
+    """
+    if isinstance(out, tuple):
+        return out[0], out[1]
+    return out, None
+
+
 def _forward_batch(model: nn.Module, batch, device: torch.device):
+    """Returns ``(logits, labels, energies, aux_loss)``; aux_loss is None for
+    models without an auxiliary head."""
     model = model.to(device)
     energies = None
     non_blocking = (device.type == "cuda")
@@ -207,22 +225,22 @@ def _forward_batch(model: nn.Module, batch, device: torch.device):
         if energies is not None:
             energies = energies.to(device, non_blocking=non_blocking)
         input_tensor = SparseTensor(feats=feats, coords=coords)
-        logits = model(input_tensor)
-        return logits, labels, energies
+        logits, aux_loss = _split_model_output(model(input_tensor))
+        return logits, labels, energies, aux_loss
 
     if HeteroData is not None and isinstance(batch, HeteroData):
         batch = batch.to(device, non_blocking=non_blocking)
         labels = batch.y
         energies = getattr(batch, "true_energy", None)
-        logits = model(batch)
-        return logits, labels, energies
+        logits, aux_loss = _split_model_output(model(batch))
+        return logits, labels, energies, aux_loss
 
     if hasattr(batch, "to") and hasattr(batch, "y"):
         batch = batch.to(device, non_blocking=non_blocking)
         labels = batch.y
         energies = getattr(batch, "true_energy", None)
-        logits = model(batch)
-        return logits, labels, energies
+        logits, aux_loss = _split_model_output(model(batch))
+        return logits, labels, energies, aux_loss
 
     raise TypeError(
         "Unsupported batch type. Expected SparseTensor collate output or a PyG HeteroData batch."
@@ -251,7 +269,7 @@ def train_epoch(
     all_targets = []
 
     for batch in loader:
-        logits, labels, energies = _forward_batch(model, batch, device)
+        logits, labels, energies, aux_loss = _forward_batch(model, batch, device)
         batch_size = labels.size(0)
 
         optimizer.zero_grad()
@@ -263,6 +281,11 @@ def train_epoch(
             energy_alpha=energy_alpha,
             criterion=criterion,
         )
+        # Auxiliary supervision (already scaled by the model's aux_weight).
+        # Train only: keeping it out of validate_epoch means val_loss stays
+        # the event loss alone and stays comparable across leaderboard rows.
+        if aux_loss is not None:
+            loss = loss + aux_loss
 
         loss.backward()
         optimizer.step()
@@ -302,7 +325,7 @@ def validate_epoch(
 
     with torch.no_grad():
         for batch in loader:
-            logits, labels, energies = _forward_batch(model, batch, device)
+            logits, labels, energies, _ = _forward_batch(model, batch, device)
             batch_size = labels.size(0)
 
             loss = compute_batch_loss(
@@ -331,6 +354,39 @@ def validate_epoch(
         optimize_metric=threshold_metric,
     )
     return avg_loss, metrics["accuracy"], metrics, probs_np, targets_np
+
+
+def run_inference(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device = torch.device("cpu"),
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Runs the model over a loader and collects per-event predicted CC
+    probability, true label, and true neutrino energy (GeV). Unlike
+    validate_epoch, this does not compute loss/threshold — it's meant for
+    post-hoc analysis (e.g. energy-stratified metrics) where the caller wants
+    the raw per-event arrays.
+    """
+    model = model.to(device)
+    model.eval()
+    all_probs = []
+    all_targets = []
+    all_energies = []
+
+    with torch.no_grad():
+        for batch in loader:
+            logits, labels, energies, _ = _forward_batch(model, batch, device)
+            probs = torch.softmax(logits, dim=1)[:, 1]
+
+            all_probs.extend(probs.cpu().numpy())
+            all_targets.extend(labels.cpu().numpy())
+            if energies is not None:
+                all_energies.extend(energies.cpu().numpy())
+            else:
+                all_energies.extend([float("nan")] * labels.size(0))
+
+    return np.array(all_probs), np.array(all_targets), np.array(all_energies)
 
 
 def train_model(
@@ -559,6 +615,38 @@ def save_model_checkpoint(
     return filepath
 
 
+def _migrate_leaderboard_header(csv_path: str, fieldnames: list) -> None:
+    """
+    Bring an existing leaderboard up to the current column set.
+
+    csv.DictWriter only writes a header when the file is new, so appending a row
+    with new fields to a file carrying an older header would silently misalign
+    every subsequent column. This reads the file, adds any missing columns as
+    empty, and rewrites it -- taking a .bak copy first, since the leaderboard is
+    the experimental record. Existing values are never modified.
+    """
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        existing = next(csv.reader(f), None)
+    if existing is None or list(existing) == list(fieldnames):
+        return
+
+    missing = [c for c in fieldnames if c not in existing]
+    extra = [c for c in existing if c not in fieldnames]
+    if extra:
+        # Don't drop columns we don't recognise -- keep them on the end.
+        fieldnames = list(fieldnames) + extra
+
+    df = pd.read_csv(csv_path)
+    for col in missing:
+        df[col] = ""
+    df = df.reindex(columns=fieldnames)
+
+    backup = f"{csv_path}.bak"
+    shutil.copy2(csv_path, backup)
+    df.to_csv(csv_path, index=False)
+    print(f"Leaderboard schema updated (added {missing}); previous file backed up to {backup}")
+
+
 def log_experiment(
     config: Dict[str, Any],
     model_name: str,
@@ -590,6 +678,14 @@ def log_experiment(
         "weight_decay",
         "feature_mode",
         "max_events",
+        # n_events is the *realised* len(dataset). It decides the train/val split
+        # and therefore which runs are comparable at all: the pre-v3 dataset
+        # builder required both views non-empty (11,694 events) while the v3 /
+        # hitset filter keeps any event with >=1 hit (11,925), and the smaller set
+        # is systematically easier. max_events recorded the requested cap for
+        # pre-2026-08-06 rows, which is what hid that split.
+        "n_events",
+        "seed",
         "model_path",
     ]
 
@@ -612,10 +708,15 @@ def log_experiment(
         "weight_decay": config.get("weight_decay", 0.0),
         "feature_mode": config.get("feature_mode", "sum"),
         "max_events": config.get("max_events", "all"),
+        "n_events": config.get("n_events", ""),
+        "seed": config.get("seed", ""),
         "model_path": model_path,
     }
 
     file_exists = os.path.exists(csv_path)
+    if file_exists:
+        _migrate_leaderboard_header(csv_path, fieldnames)
+
     with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:

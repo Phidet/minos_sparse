@@ -62,6 +62,12 @@ def parse_args():
         "--no_auto_commit", action="store_true", default=False,
         help="Disable automatic git commit before training"
     )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Random seed for model init and batch shuffling (default: DATASET_CONFIG['random_seed']). "
+             "The train/val split is NOT affected -- it stays pinned to DATASET_CONFIG['random_seed'] "
+             "so results remain comparable across seeds."
+    )
     return parser.parse_args()
 
 
@@ -99,33 +105,41 @@ def main():
     else:
         git_hash = "manual-run"
 
-    # Set random seeds
-    seed = DATASET_CONFIG.get("random_seed", 42)
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    # Two distinct seeds, deliberately separated:
+    #
+    #   split_seed -- ALWAYS DATASET_CONFIG['random_seed']. Pins the train/val
+    #     split so every run scores on the same validation events and stays
+    #     comparable. Never overridden by --seed.
+    #   run_seed   -- model init and batch shuffle order. Re-applied at the top
+    #     of each model's iteration below (NOT once here), so a model's result
+    #     depends only on (config, seed) and not on its position in --models.
+    #     Previously this was seeded once before the loop, which meant the same
+    #     config gave different results depending on what ran before it.
+    split_seed = DATASET_CONFIG.get("random_seed", 42)
+    run_seed = args.seed if args.seed is not None else split_seed
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Split seed (fixed): {split_seed} | Run seed (init/shuffle): {run_seed}")
     print(f"PyTorch Device: {device}\n")
 
-    # Determine which feature_modes are needed across all target models
+    # Determine which distinct datasets are needed across all target models.
+    # Keyed by cache_path (not just feature_mode): two configs can share a
+    # feature_mode but need different data (e.g. 'timing' vs. an
+    # ablate_timing=True variant pointing at a different cache_path).
     max_events = args.max_events if args.max_events is not None else DATASET_CONFIG["max_events"]
-    needed_modes = set()
+    needed_cache_paths = {}
     for key in target_keys:
         config = get_config(key)
-        needed_modes.add(config.get("feature_mode", DATASET_CONFIG["feature_mode"]))
+        cache_path = config.get("cache_path", DATASET_CONFIG["cache_path"])
+        needed_cache_paths.setdefault(cache_path, config)
 
-    # Lazily load datasets keyed by feature_mode
+    # Lazily load datasets keyed by cache_path
     datasets = {}
-    for mode in needed_modes:
-        cache_path = DATASET_CONFIG["cache_path"]
-        # Use per-model cache_path if specified in any config with this mode
-        for key in target_keys:
-            cfg = get_config(key)
-            if cfg.get("feature_mode", DATASET_CONFIG["feature_mode"]) == mode:
-                cache_path = cfg.get("cache_path", DATASET_CONFIG["cache_path"])
-                break
+    for cache_path, config in needed_cache_paths.items():
+        mode = config.get("feature_mode", DATASET_CONFIG["feature_mode"])
+        ablate_timing = config.get("ablate_timing", False)
 
-        print(f"Loading MINOS dataset (max_events={max_events}, feature_mode='{mode}')...")
-        datasets[mode] = MINOSMultiViewGraphDataset(
+        print(f"Loading MINOS dataset (max_events={max_events}, feature_mode='{mode}', ablate_timing={ablate_timing}, cache_path='{cache_path}')...")
+        datasets[cache_path] = MINOSMultiViewGraphDataset(
             root_filepath=DATASET_CONFIG["root_filepath"],
             max_events=max_events,
             view_ids=DATASET_CONFIG["view_ids"],
@@ -134,19 +148,27 @@ def main():
             feature_mode=mode,
             cache_path=cache_path,
             allow_root_fallback=DATASET_CONFIG.get("allow_root_fallback", True),
+            ablate_timing=ablate_timing,
         )
-        print(f"  Loaded {len(datasets[mode])} events for feature_mode='{mode}'")
+        print(f"  Loaded {len(datasets[cache_path])} events for feature_mode='{mode}'")
 
     # Train each model configuration
     completed_runs = []
     for idx, key in enumerate(target_keys, 1):
+        # Re-seed per model (not once before the loop) so that a model's weight
+        # init and shuffle order depend only on (config, run_seed) -- identical
+        # whether it runs first or fifth in the campaign.
+        torch.manual_seed(run_seed)
+        np.random.seed(run_seed)
+
         config = get_config(key)
         model_name = config["model_name"]
         num_epochs = args.num_epochs if args.num_epochs is not None else config.get("num_epochs", 12)
         lr = args.lr if args.lr is not None else config.get("lr", 1e-3)
         batch_size = config.get("batch_size", 32)
         model_feature_mode = config.get("feature_mode", DATASET_CONFIG["feature_mode"])
-        dataset = datasets[model_feature_mode]
+        model_cache_path = config.get("cache_path", DATASET_CONFIG["cache_path"])
+        dataset = datasets[model_cache_path]
 
         criterion = config.get("loss", config.get("loss_fn", config.get("criterion", None)))
         loss_name = criterion.__class__.__name__ if hasattr(criterion, "__class__") else str(criterion)
@@ -161,7 +183,7 @@ def main():
             dataset,
             batch_size=batch_size,
             val_split=DATASET_CONFIG.get("val_split", 0.20),
-            random_seed=seed,
+            random_seed=split_seed,
         )
 
         if config.get("use_class_weights", False):
@@ -215,9 +237,19 @@ def main():
             history=history,
         )
 
-        # Log metrics & hyperparameters to CSV leaderboard
+        # Log metrics & hyperparameters to CSV leaderboard.
+        # Record the *resolved* values rather than the config defaults, so that
+        # --num_epochs/--lr overrides are reflected in the leaderboard instead
+        # of it silently claiming the config's default.
         run_config = dict(config)
         run_config["max_events"] = len(dataset)
+        run_config["num_epochs"] = num_epochs
+        run_config["lr"] = lr
+        # n_events is the realised dataset length, which is what determines the
+        # validation split and therefore which runs are comparable at all.
+        # (max_events historically recorded the requested cap for pre-Aug-6 runs.)
+        run_config["n_events"] = len(dataset)
+        run_config["seed"] = run_seed
         leaderboard_df = log_experiment(
             config=run_config,
             model_name=model_name,

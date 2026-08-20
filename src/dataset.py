@@ -16,6 +16,45 @@ except ImportError:
 
 _CACHE_MAGIC = "minos_sparse_cache_v2"
 
+# Per-hit truth attribute names carried on the Data objects.
+#
+# These were originally called hit_mu_frac / has_mu_truth. That was a misnomer:
+# the target is the outgoing PRIMARY LEPTON at stdhep index 4, and measured over
+# the full file, 1.50% of CC events are nu_e CC with an electron there (1,332 of
+# 88,783; cross-checked against mc.inu, which gives 1.509% and agrees on every
+# event). An electron showers rather than leaving a track, so the label genuinely
+# is not muon-specific.
+#
+# Caches written before the rename store the old names, and they are ~1.3 GB, so
+# readers go through the accessors below instead of forcing a rebuild.
+_LEGACY_TRUTH_NAMES = {
+    "hit_lepton_frac": "hit_mu_frac",
+    "has_lepton_truth": "has_mu_truth",
+}
+
+
+def _truth_attr(data, name: str, required: bool = True):
+    value = getattr(data, name, None)
+    if value is None:
+        value = getattr(data, _LEGACY_TRUTH_NAMES[name], None)
+    if value is None and required:
+        raise AttributeError(
+            f"'{name}' not found on this Data object (nor its legacy alias "
+            f"'{_LEGACY_TRUTH_NAMES[name]}'). Per-hit truth is only produced by "
+            "feature_mode 'hitset' or 'timing_aux'."
+        )
+    return value
+
+
+def get_hit_lepton_frac(data, required: bool = True):
+    """Soft per-hit primary-lepton charge fraction, tolerating pre-rename caches."""
+    return _truth_attr(data, "hit_lepton_frac", required=required)
+
+
+def get_has_lepton_truth(data, required: bool = True):
+    """Per-graph flag: is stdhep index 4 a usable final-state lepton?"""
+    return _truth_attr(data, "has_lepton_truth", required=required)
+
 
 def _load_cache_file(cache_path: Path) -> dict:
     cache = torch.load(cache_path, map_location="cpu", weights_only=False)
@@ -281,6 +320,26 @@ class MINOSMultiViewGraphDataset(Dataset):
       - 'timing': 9 hit features with timing/spatial info, merged homogeneous graph
                   [PE_east_log, PE_west_log, t_scaled, dt_scaled, tpos_norm, z_norm,
                    view_flag, readout_valid_east, readout_valid_west]
+      - 'timing_aux': identical graph to 'timing' (same x/edge_index/edge_attr/y)
+                  plus per-hit primary-lepton truth (``hit_lepton_frac``,
+                  ``has_lepton_truth``) for the auxiliary segmentation head. Kept as a
+                  separate mode with its own cache so the existing 'timing' caches
+                  and their leaderboard rows stay untouched.
+      - 'hitset': 14 hit features, edgeless homogeneous Data for set/transformer
+                  models. Features 1-9 are byte-identical to 'timing' (they share
+                  ``_hit_time_features``), plus
+                  [asym, sigcor_east_log, sigcor_west_log, ndigit_norm, demuxveto].
+                  Also carries per-hit primary-lepton truth (``hit_lepton_frac``,
+                  ``has_lepton_truth``) derived from thstp -- see
+                  ``_build_hitset_event``. Hits are sorted by (z, tpos) so that
+                  downstream truncation is deterministic and keeps the upstream
+                  (vertex) region of the event.
+
+    ``ablate_timing`` (only meaningful with feature_mode='timing') zeroes the
+    timing-derived values (node dims t_scaled/dt_scaled, edge dims
+    Δt_scaled/causal_flag) while keeping graph topology, tensor shapes, and the
+    set of dropped/kept events identical to the real timing run — used to
+    isolate timing's contribution to model performance in ablation studies.
     """
 
     def __init__(
@@ -294,6 +353,7 @@ class MINOSMultiViewGraphDataset(Dataset):
         feature_mode: str = "dual_ph",
         cache_path: Optional[str] = None,
         allow_root_fallback: bool = True,
+        ablate_timing: bool = False,
     ):
         super().__init__()
 
@@ -302,6 +362,7 @@ class MINOSMultiViewGraphDataset(Dataset):
         self.strip_radius = int(strip_radius)
         self.graph_mode = str(graph_mode)
         self.feature_mode = str(feature_mode)
+        self.ablate_timing = bool(ablate_timing)
         self.events = []
 
         cache_file = Path(cache_path) if cache_path is not None else None
@@ -312,10 +373,11 @@ class MINOSMultiViewGraphDataset(Dataset):
 
             cached_view_ids = tuple(cache.get("view_ids", ()))
             cached_feature_mode = cache.get("feature_mode", "sum")
+            cached_ablate_timing = bool(cache.get("ablate_timing", False))
             cached_max_events = cache.get("max_events", None)
             cached_events = cache["events"]
             valid_view_ids = (view_ids is None or tuple(int(v) for v in view_ids) == cached_view_ids)
-            valid_mode = (cached_feature_mode == self.feature_mode)
+            valid_mode = (cached_feature_mode == self.feature_mode) and (cached_ablate_timing == self.ablate_timing)
 
             if valid_view_ids and valid_mode:
                 if max_events is not None and len(cached_events) < max_events and cached_max_events is not None and cached_max_events < max_events:
@@ -366,12 +428,29 @@ class MINOSMultiViewGraphDataset(Dataset):
             "NtpStRecord/mc/mc.iaction",
             "NtpStRecord/mc/mc.p4neu[4]",
         ]
-        if self.feature_mode == "timing":
+        if self.feature_mode in ("timing", "timing_aux", "hitset"):
             req_branches.extend([
                 "NtpStRecord/stp/stp.time0",
                 "NtpStRecord/stp/stp.time1",
                 "NtpStRecord/stp/stp.tpos",
                 "NtpStRecord/stp/stp.z",
+            ])
+        if self.feature_mode == "hitset":
+            req_branches.extend([
+                "NtpStRecord/stp/stp.ph0.sigcor",
+                "NtpStRecord/stp/stp.ph1.sigcor",
+                "NtpStRecord/stp/stp.ndigit",
+                "NtpStRecord/stp/stp.demuxveto",
+            ])
+        if self.feature_mode in ("hitset", "timing_aux"):
+            req_branches.extend([
+                # Per-hit truth. thstp is index-aligned 1:1 with stp (verified);
+                # thstp.stdhep holds *signed indices into the stdhep array*, not
+                # PDG codes. stdhep index 4 is the outgoing primary lepton.
+                "NtpStRecord/thstp/thstp.stdhep[3]",
+                "NtpStRecord/thstp/thstp.phfrac[3]",
+                "NtpStRecord/stdhep/stdhep.IdHEP",
+                "NtpStRecord/stdhep/stdhep.IstHEP",
             ])
 
         branches = tree.arrays(req_branches, entry_stop=max_events)
@@ -405,14 +484,47 @@ class MINOSMultiViewGraphDataset(Dataset):
             ph0 = np.array(branches["NtpStRecord/stp/stp.ph0.pe"][i])
             ph1 = np.array(branches["NtpStRecord/stp/stp.ph1.pe"][i])
 
-            if self.feature_mode == "timing":
+            if self.feature_mode in ("timing", "timing_aux", "hitset"):
                 time0 = np.array(branches["NtpStRecord/stp/stp.time0"][i])
                 time1 = np.array(branches["NtpStRecord/stp/stp.time1"][i])
                 tpos = np.array(branches["NtpStRecord/stp/stp.tpos"][i])
                 z = np.array(branches["NtpStRecord/stp/stp.z"][i])
+
+            if self.feature_mode == "hitset":
+                event = self._build_hitset_event(
+                    views, planes, ph0, ph1, time0, time1, tpos, z,
+                    np.array(branches["NtpStRecord/stp/stp.ph0.sigcor"][i]),
+                    np.array(branches["NtpStRecord/stp/stp.ph1.sigcor"][i]),
+                    np.array(branches["NtpStRecord/stp/stp.ndigit"][i]),
+                    np.array(branches["NtpStRecord/stp/stp.demuxveto"][i]),
+                    np.array(branches["NtpStRecord/thstp/thstp.stdhep[3]"][i]),
+                    np.array(branches["NtpStRecord/thstp/thstp.phfrac[3]"][i]),
+                    np.array(branches["NtpStRecord/stdhep/stdhep.IdHEP"][i]),
+                    np.array(branches["NtpStRecord/stdhep/stdhep.IstHEP"][i]),
+                    label, true_energy,
+                )
+            elif self.feature_mode in ("timing", "timing_aux"):
+                # 'timing_aux' produces a graph identical to 'timing' -- same x,
+                # edge_index, edge_attr, y -- plus per-hit primary-lepton truth.
                 event = self._build_timing_graph(
                     views, planes, strips, ph0, ph1,
                     time0, time1, tpos, z, label, true_energy,
+                    thstp_stdhep=(
+                        np.array(branches["NtpStRecord/thstp/thstp.stdhep[3]"][i])
+                        if self.feature_mode == "timing_aux" else None
+                    ),
+                    thstp_phfrac=(
+                        np.array(branches["NtpStRecord/thstp/thstp.phfrac[3]"][i])
+                        if self.feature_mode == "timing_aux" else None
+                    ),
+                    idhep=(
+                        np.array(branches["NtpStRecord/stdhep/stdhep.IdHEP"][i])
+                        if self.feature_mode == "timing_aux" else None
+                    ),
+                    isthep=(
+                        np.array(branches["NtpStRecord/stdhep/stdhep.IstHEP"][i])
+                        if self.feature_mode == "timing_aux" else None
+                    ),
                 )
             else:
                 event = self._build_event_graph(views, planes, strips, ph0, ph1, label, true_energy)
@@ -436,6 +548,7 @@ class MINOSMultiViewGraphDataset(Dataset):
                     "strip_radius": self.strip_radius,
                     "graph_mode": self.graph_mode,
                     "feature_mode": self.feature_mode,
+                    "ablate_timing": self.ablate_timing,
                     "max_events": max_events,
                     "events": self.events,
                 },
@@ -443,7 +556,9 @@ class MINOSMultiViewGraphDataset(Dataset):
 
     @property
     def in_channels(self) -> int:
-        if self.feature_mode == "timing":
+        if self.feature_mode == "hitset":
+            return 14
+        elif self.feature_mode in ("timing", "timing_aux"):
             return 9
         elif self.feature_mode == "dual_ph":
             return 2
@@ -614,58 +729,30 @@ class MINOSMultiViewGraphDataset(Dataset):
 
     # ── Timing-aware merged graph construction ────────────────────────
 
-    def _build_timing_graph(
+    def _hit_time_features(
         self,
-        views: np.ndarray,
-        planes: np.ndarray,
-        strips: np.ndarray,
-        ph0: np.ndarray,
-        ph1: np.ndarray,
-        time0: np.ndarray,
-        time1: np.ndarray,
-        tpos: np.ndarray,
-        z: np.ndarray,
-        label: int,
-        true_energy: float,
-    ):
-        """Build a merged homogeneous graph with timing features for both views."""
-        if Data is None:
-            raise ImportError(
-                "torch_geometric is required for timing graph construction."
-            )
+        sel_time0: np.ndarray,
+        sel_time1: np.ndarray,
+        sel_views: np.ndarray,
+        view_a_id: int,
+        valid_east: np.ndarray,
+        valid_west: np.ndarray,
+    ) -> tuple:
+        """
+        Per-hit time features shared by feature_mode 'timing' and 'hitset'.
 
-        view_a_id, view_b_id = self.view_ids
-        mask_a = views == view_a_id
-        mask_b = views == view_b_id
-        combined_mask = mask_a | mask_b
+        Extracted verbatim from the original inline block in
+        ``_build_timing_graph`` so both modes are guaranteed byte-identical
+        here; a regression check against the pre-extraction implementation
+        lives in scripts/verify_hitset.py.
 
-        if np.sum(mask_a) == 0 or np.sum(mask_b) == 0:
-            return None
+        Returns ``(t_rel, t_scaled, dt_scaled, both_valid)`` where ``t_rel`` is
+        the event-median-subtracted mean hit time in ns (unclipped, used for
+        edge construction) and the two ``*_scaled`` arrays are the clipped,
+        normalised node features.
+        """
+        n_hits = len(sel_time0)
 
-        # Select hits from both views
-        sel_ph0 = ph0[combined_mask]
-        sel_ph1 = ph1[combined_mask]
-        sel_time0 = time0[combined_mask]
-        sel_time1 = time1[combined_mask]
-        sel_tpos = tpos[combined_mask]
-        sel_z = z[combined_mask]
-        sel_planes = planes[combined_mask]
-        sel_views = views[combined_mask]
-        n_hits = int(np.sum(combined_mask))
-
-        if n_hits < 2:
-            return None
-
-        # --- Readout validity masks ---
-        # Sentinel value for missing readout is -999999 in time, and 0 in ph
-        valid_east = (sel_ph0 > 0).astype(np.float32)
-        valid_west = (sel_ph1 > 0).astype(np.float32)
-
-        # --- Charge features (log-scaled) ---
-        pe_east_log = np.log1p(np.maximum(0.0, sel_ph0)).astype(np.float32)
-        pe_west_log = np.log1p(np.maximum(0.0, sel_ph1)).astype(np.float32)
-
-        # --- Time features ---
         # Convert times from seconds to nanoseconds
         t0_ns = sel_time0 * 1e9
         t1_ns = sel_time1 * 1e9
@@ -696,6 +783,20 @@ class MINOSMultiViewGraphDataset(Dataset):
             t0_event = 0.0
         t_rel = t_mean_raw - t0_event
 
+        # Correct the view-dependent sign flip in the E/W time-difference vs.
+        # strip-position relationship: empirically, view U (view_a_id) gives
+        # dt = +slope*tpos while view V (view_b_id) gives dt = -slope*tpos
+        # (same magnitude, opposite sign — confirmed via a direct dt-vs-tpos
+        # correlation check against the ROOT file: r=+0.21 for view U,
+        # r=-0.24 for view V, vs. r=-0.01 when both views are pooled without
+        # this correction). Without it, the real position-encoding signal in
+        # dt cancels out when both views are merged into one homogeneous
+        # graph. This only affects the per-hit dt_raw/dt_scaled node feature —
+        # t_rel (and therefore edge features / graph topology, which are both
+        # built from t_rel, not dt_raw) is unaffected.
+        view_sign = np.where(sel_views == view_a_id, 1.0, -1.0)
+        dt_raw = dt_raw * view_sign
+
         # Clip and scale
         T_MAX_NS = 150.0
         DT_MAX_NS = 300.0
@@ -709,6 +810,80 @@ class MINOSMultiViewGraphDataset(Dataset):
         # For single-ended hits, dt is not meaningful — zero it out
         dt_scaled[~both_valid] = 0.0
 
+        return t_rel, t_scaled, dt_scaled, both_valid
+
+    def _build_timing_graph(
+        self,
+        views: np.ndarray,
+        planes: np.ndarray,
+        strips: np.ndarray,
+        ph0: np.ndarray,
+        ph1: np.ndarray,
+        time0: np.ndarray,
+        time1: np.ndarray,
+        tpos: np.ndarray,
+        z: np.ndarray,
+        label: int,
+        true_energy: float,
+        thstp_stdhep: Optional[np.ndarray] = None,
+        thstp_phfrac: Optional[np.ndarray] = None,
+        idhep: Optional[np.ndarray] = None,
+        isthep: Optional[np.ndarray] = None,
+    ):
+        """
+        Build a merged homogeneous graph with timing features for both views.
+
+        When the thstp/stdhep arrays are supplied (feature_mode='timing_aux'),
+        the graph additionally carries ``hit_lepton_frac`` / ``has_lepton_truth`` for the
+        auxiliary segmentation head. The graph itself -- x, edge_index, edge_attr,
+        y -- is bit-identical either way, so 'timing' and 'timing_aux' runs remain
+        directly comparable (asserted in scripts/verify_hitset.py).
+        """
+        if Data is None:
+            raise ImportError(
+                "torch_geometric is required for timing graph construction."
+            )
+
+        view_a_id, view_b_id = self.view_ids
+        mask_a = views == view_a_id
+        mask_b = views == view_b_id
+        combined_mask = mask_a | mask_b
+        n_hits = int(np.sum(combined_mask))
+
+        # Only drop events with literally no hits in either tracked view. A
+        # prior version also required BOTH views to be non-empty, which
+        # silently dropped any event whose hits all landed in a single view
+        # (confirmed to be the sole driver of the ~2.5% drop rate, sharply
+        # biased toward low-energy events with sparse hit counts). A 1-hit
+        # event becomes a legitimate 1-node, 0-edge graph, which
+        # _build_timing_edges and the GNN forward pass already handle.
+        if n_hits < 1:
+            return None
+
+        # Select hits from both views
+        sel_ph0 = ph0[combined_mask]
+        sel_ph1 = ph1[combined_mask]
+        sel_time0 = time0[combined_mask]
+        sel_time1 = time1[combined_mask]
+        sel_tpos = tpos[combined_mask]
+        sel_z = z[combined_mask]
+        sel_planes = planes[combined_mask]
+        sel_views = views[combined_mask]
+
+        # --- Readout validity masks ---
+        # Sentinel value for missing readout is -999999 in time, and 0 in ph
+        valid_east = (sel_ph0 > 0).astype(np.float32)
+        valid_west = (sel_ph1 > 0).astype(np.float32)
+
+        # --- Charge features (log-scaled) ---
+        pe_east_log = np.log1p(np.maximum(0.0, sel_ph0)).astype(np.float32)
+        pe_west_log = np.log1p(np.maximum(0.0, sel_ph1)).astype(np.float32)
+
+        # --- Time features ---
+        t_rel, t_scaled, dt_scaled, both_valid = self._hit_time_features(
+            sel_time0, sel_time1, sel_views, view_a_id, valid_east, valid_west,
+        )
+
         # --- Spatial features ---
         tpos_norm = (sel_tpos / 4.0).astype(np.float32)
         z_norm = ((sel_z - 15.0) / 15.0).astype(np.float32)
@@ -717,11 +892,20 @@ class MINOSMultiViewGraphDataset(Dataset):
         view_flag = np.where(sel_views == view_a_id, 0.0, 1.0).astype(np.float32)
 
         # --- Assemble 9-feature node vector ---
+        node_t_scaled = t_scaled.astype(np.float32)
+        node_dt_scaled = dt_scaled.astype(np.float32)
+        if self.ablate_timing:
+            # Zero the timing-derived values while keeping shapes, topology, and
+            # the dropped-event set identical to the real timing run — isolates
+            # timing's contribution for ablation studies.
+            node_t_scaled = np.zeros_like(node_t_scaled)
+            node_dt_scaled = np.zeros_like(node_dt_scaled)
+
         node_feats = np.column_stack([
             pe_east_log,
             pe_west_log,
-            t_scaled.astype(np.float32),
-            dt_scaled.astype(np.float32),
+            node_t_scaled,
+            node_dt_scaled,
             tpos_norm,
             z_norm,
             view_flag,
@@ -732,10 +916,19 @@ class MINOSMultiViewGraphDataset(Dataset):
         x = torch.tensor(node_feats, dtype=torch.float32)
 
         # --- Edge construction: spacetime kNN ---
+        # Graph topology is built from the real timing values regardless of
+        # ablate_timing, so the kNN structure stays identical across ablated
+        # vs. non-ablated runs; only the returned edge feature values differ.
         edge_index, edge_attr = self._build_timing_edges(
             sel_z, sel_tpos, t_rel.astype(np.float32),
             sel_views, sel_planes, view_a_id, view_b_id, k=8,
         )
+        if self.ablate_timing and edge_attr.numel() > 0:
+            # Edge features are [Δz, Δtpos, Δt_scaled, ||r||, causal_flag, same_view_flag]
+            # (see _build_timing_edges) — zero the two timing-derived columns.
+            edge_attr = edge_attr.clone()
+            edge_attr[:, 2] = 0.0
+            edge_attr[:, 4] = 0.0
 
         # --- Build homogeneous Data object ---
         data = Data(
@@ -744,6 +937,170 @@ class MINOSMultiViewGraphDataset(Dataset):
             edge_attr=edge_attr,
             y=torch.tensor(label, dtype=torch.long),
         )
+        data.true_energy = torch.tensor(true_energy, dtype=torch.float32)
+
+        if thstp_stdhep is not None:
+            # Hits are in combined_mask order here (no (z, tpos) sort, unlike
+            # _build_hitset_event), so the helper's output needs no permutation.
+            lepton_frac, has_lepton_truth = self._primary_lepton_frac(
+                combined_mask, n_hits, thstp_stdhep, thstp_phfrac, idhep, isthep,
+            )
+            data.hit_lepton_frac = torch.tensor(lepton_frac, dtype=torch.float32)
+            data.has_lepton_truth = torch.tensor(bool(has_lepton_truth))
+
+        return data
+
+    # ── Edgeless hit-set construction (for set/transformer models) ─────
+
+    # stdhep index of the outgoing primary lepton. Verified on 19,861 events:
+    # IstHEP[4]==1 and |IdHEP[4]| in _LEPTON_IDS for 99.06% of them; CC gives
+    # ±13 (muon) or ±11 (nue-CC), NC gives ±14/±12 (an outgoing neutrino, which
+    # deposits nothing — so NC events correctly get an all-zero hit_lepton_frac).
+    _PRIMARY_LEPTON_STDHEP_IDX = 4
+    _LEPTON_IDS = frozenset({11, 12, 13, 14, 16})
+
+    def _primary_lepton_frac(
+        self,
+        combined_mask: np.ndarray,
+        n_hits: int,
+        thstp_stdhep: np.ndarray,
+        thstp_phfrac: np.ndarray,
+        idhep: np.ndarray,
+        isthep: np.ndarray,
+    ) -> tuple:
+        """
+        Soft per-hit primary-lepton charge fraction, shared by feature_mode
+        'hitset' and 'timing_aux'.
+
+        Returns ``(lepton_frac[n_hits] in [0, 1], has_lepton_truth)``. The returned array
+        follows ``combined_mask`` order; callers that reorder their hits (hitset
+        sorts by (z, tpos), timing_aux does not) must apply the same permutation
+        to this array.
+
+        ``has_lepton_truth`` is False for the ~0.9% of events where stdhep index 4 is
+        not a final-state lepton; those must be excluded from the auxiliary loss
+        rather than treated as all-zero targets.
+        """
+        lepton_frac = np.zeros(n_hits, dtype=np.float32)
+        lep_idx = self._PRIMARY_LEPTON_STDHEP_IDX
+        has_lepton_truth = (
+            idhep.size > lep_idx
+            and int(isthep[lep_idx]) == 1
+            and abs(int(idhep[lep_idx])) in self._LEPTON_IDS
+        )
+        if has_lepton_truth and thstp_stdhep.size:
+            # thstp is index-aligned with the full stp array, so mask first.
+            sh = thstp_stdhep[combined_mask]        # [n_hits, 3] signed indices
+            pf = thstp_phfrac[combined_mask]        # [n_hits, 3] charge fractions
+            lepton_frac = (pf * (np.abs(sh) == lep_idx)).sum(axis=1).astype(np.float32)
+            lepton_frac = np.clip(lepton_frac, 0.0, 1.0)
+        return lepton_frac, has_lepton_truth
+
+    def _build_hitset_event(
+        self,
+        views: np.ndarray,
+        planes: np.ndarray,
+        ph0: np.ndarray,
+        ph1: np.ndarray,
+        time0: np.ndarray,
+        time1: np.ndarray,
+        tpos: np.ndarray,
+        z: np.ndarray,
+        sigcor0: np.ndarray,
+        sigcor1: np.ndarray,
+        ndigit: np.ndarray,
+        demuxveto: np.ndarray,
+        thstp_stdhep: np.ndarray,
+        thstp_phfrac: np.ndarray,
+        idhep: np.ndarray,
+        isthep: np.ndarray,
+        label: int,
+        true_energy: float,
+    ):
+        """
+        Build an edgeless homogeneous ``Data`` of per-strip tokens.
+
+        Carries a soft per-hit primary-lepton charge fraction as an auxiliary
+        segmentation target. See ``_PRIMARY_LEPTON_STDHEP_IDX`` for the truth
+        derivation and the class docstring for the feature layout.
+        """
+        if Data is None:
+            raise ImportError(
+                "torch_geometric is required for hitset event construction."
+            )
+
+        view_a_id, view_b_id = self.view_ids
+        combined_mask = (views == view_a_id) | (views == view_b_id)
+        n_hits = int(np.sum(combined_mask))
+        if n_hits < 1:
+            return None
+
+        sel_ph0 = ph0[combined_mask]
+        sel_ph1 = ph1[combined_mask]
+        sel_views = views[combined_mask]
+
+        valid_east = (sel_ph0 > 0).astype(np.float32)
+        valid_west = (sel_ph1 > 0).astype(np.float32)
+
+        # Features 1-9: identical to feature_mode='timing'.
+        pe_east_log = np.log1p(np.maximum(0.0, sel_ph0)).astype(np.float32)
+        pe_west_log = np.log1p(np.maximum(0.0, sel_ph1)).astype(np.float32)
+        _, t_scaled, dt_scaled, both_valid = self._hit_time_features(
+            time0[combined_mask], time1[combined_mask],
+            sel_views, view_a_id, valid_east, valid_west,
+        )
+        tpos_norm = (tpos[combined_mask] / 4.0).astype(np.float32)
+        z_norm = ((z[combined_mask] - 15.0) / 15.0).astype(np.float32)
+        view_flag = np.where(sel_views == view_a_id, 0.0, 1.0).astype(np.float32)
+
+        # Feature 10: east/west charge asymmetry. Together with dt this is a
+        # second, independent handle on position *along* the strip (via the
+        # ~5 m WLS attenuation length), which the projected U/V views discard.
+        # Only meaningful when both ends read out.
+        asym = ((sel_ph0 - sel_ph1) / (sel_ph0 + sel_ph1 + 1e-5)).astype(np.float32)
+        asym[~both_valid] = 0.0
+
+        # Features 11-14: strip-to-strip corrected charge and readout condition.
+        sigcor_east_log = np.log1p(np.maximum(0.0, sigcor0[combined_mask])).astype(np.float32)
+        sigcor_west_log = np.log1p(np.maximum(0.0, sigcor1[combined_mask])).astype(np.float32)
+        ndigit_norm = (np.clip(ndigit[combined_mask], 0, 4) / 4.0).astype(np.float32)
+        demux_flag = (demuxveto[combined_mask] != 0).astype(np.float32)
+
+        node_feats = np.column_stack([
+            pe_east_log,
+            pe_west_log,
+            t_scaled.astype(np.float32),
+            dt_scaled.astype(np.float32),
+            tpos_norm,
+            z_norm,
+            view_flag,
+            valid_east,
+            valid_west,
+            asym,
+            sigcor_east_log,
+            sigcor_west_log,
+            ndigit_norm,
+            demux_flag,
+        ]).astype(np.float32)
+
+        # --- Per-hit primary-lepton truth ---
+        lepton_frac, has_lepton_truth = self._primary_lepton_frac(
+            combined_mask, n_hits, thstp_stdhep, thstp_phfrac, idhep, isthep,
+        )
+
+        # Sort by (z, tpos): downstream models truncate long events by taking
+        # the first max_hits tokens, so this makes truncation deterministic and
+        # keeps the upstream (vertex + track start) region.
+        order = np.lexsort((tpos_norm, z_norm))
+        node_feats = node_feats[order]
+        lepton_frac = lepton_frac[order]
+
+        data = Data(
+            x=torch.tensor(node_feats, dtype=torch.float32),
+            y=torch.tensor(label, dtype=torch.long),
+        )
+        data.hit_lepton_frac = torch.tensor(lepton_frac, dtype=torch.float32)
+        data.has_lepton_truth = torch.tensor(bool(has_lepton_truth))
         data.true_energy = torch.tensor(true_energy, dtype=torch.float32)
         return data
 
